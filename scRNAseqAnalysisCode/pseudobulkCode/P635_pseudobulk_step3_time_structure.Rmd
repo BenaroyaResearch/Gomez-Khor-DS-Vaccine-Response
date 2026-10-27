@@ -1,0 +1,293 @@
+---
+title: "P635 pseudobulk analysis --- Step 3: processing time and cell-level structure"
+author: "Hannah DeBerg"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5)
+```
+
+# Purpose
+
+Step 3 of the clean donor-level pseudobulk analysis. Takes the 801 cells from
+step 2 and:
+
+1. adds draw-to-processing time per donor, and
+2. normalizes **for visualization only** to inspect cell-level structure
+   (PCA / UMAP), particularly whether processing time drives it.
+
+Raw counts pass through untouched --- step 4 hands DESeq2 raw integers. The
+normalization here exists solely to make the embeddings meaningful.
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(readr)
+library(readxl)
+library(ggplot2)
+library(knitr)
+library(uwot)      # UMAP
+```
+
+# Parameters
+
+```{r params}
+## --- Paths -------------------------------------------------------------------
+## All pipeline inputs live in inputs/ (see inputs/README.md for provenance).
+INPUT_DIR <- "inputs"
+DRAW_XLSX <- file.path(INPUT_DIR, "P635_draw_processed.xlsx")
+
+STEP2_RDS <- file.path("pseudobulk_clean_output", "step2_cells_chains.rds")
+OUT_DIR   <- "pseudobulk_clean_output"
+FIG_DIR   <- file.path(OUT_DIR, "figures")
+
+## --- Processing time --------------------------------------------------------
+TIME_BINARY_CUT <- 6     # hours; < cut => 0 ("fast"), >= cut => 1 ("slow")
+
+## --- Visualization-only normalization ---------------------------------------
+VIZ_MIN_CPM      <- 1    # gene kept if CPM > this in >= VIZ_MIN_FRAC of libraries
+VIZ_MIN_FRAC     <- 0.10
+VIZ_EXCLUDE_IG   <- TRUE # Ig V/D/J/C genes otherwise dominate PC1 by isotype
+VIZ_N_HVG        <- 2000
+VIZ_N_PCS        <- 20
+UMAP_N_NEIGHBORS <- 20
+UMAP_MIN_DIST    <- 0.3
+
+GROUP_COLORS <- c(TC = "blue", DS = "red")
+SEED         <- 42
+
+set.seed(SEED)
+for (d in c(OUT_DIR, FIG_DIR)) dir.create(d, showWarnings = FALSE)
+```
+
+# Load step 2
+
+```{r load_step2}
+step2     <- readRDS(STEP2_RDS)
+rawCounts <- step2$counts
+cells     <- step2$cellAnno
+geneAnno  <- step2$geneAnno
+
+cat(sprintf("step 2: %d genes x %d cells\n", nrow(rawCounts), ncol(rawCounts)))
+```
+
+# Draw-to-processing time
+
+Per-donor draw and processing timestamps. `TimeElapsed` is hours from draw to
+processing; `TimeElapsed_binary` splits at `TIME_BINARY_CUT` hours, matching the
+covariate the prior analyst used in her final MAST re-run.
+
+```{r processing_time}
+timeToProcess <- read_excel(DRAW_XLSX) %>%
+  dplyr::mutate(
+    DrawDateTime      = as.POSIXct(paste(`Draw Date`, `Draw time`),
+                                   format = "%Y-%m-%d %H:%M", tz = "UTC"),
+    ProcessedDateTime = as.POSIXct(paste(`Date Processed`, `Time Processed`),
+                                   format = "%Y-%m-%d %H:%M", tz = "UTC"),
+    TimeElapsed        = as.numeric(difftime(ProcessedDateTime, DrawDateTime, units = "hours")),
+    TimeElapsed_binary = as.integer(TimeElapsed >= TIME_BINARY_CUT)) %>%
+  dplyr::select(donorId, DrawDateTime, ProcessedDateTime, TimeElapsed, TimeElapsed_binary)
+
+stopifnot(!any(is.na(timeToProcess$TimeElapsed)))
+
+cells <- cells %>% dplyr::left_join(timeToProcess, by = "donorId")
+
+## Every donor must get a time, or the covariate is unusable downstream.
+missingTime <- cells %>% dplyr::filter(is.na(TimeElapsed)) %>% dplyr::distinct(donorId)
+if (nrow(missingTime)) {
+  warning("donors without processing time: ", paste(missingTime$donorId, collapse = ", "))
+} else cat("all donors matched to a processing time\n")
+
+cells %>%
+  dplyr::group_by(studyGroup, project, donorId) %>%
+  dplyr::summarise(nCells = dplyr::n(), TimeElapsed = dplyr::first(TimeElapsed),
+                   TimeElapsed_binary = dplyr::first(TimeElapsed_binary), .groups = "drop") %>%
+  dplyr::arrange(TimeElapsed) %>%
+  dplyr::mutate(TimeElapsed = round(TimeElapsed, 1)) %>%
+  kable(caption = "Draw-to-processing time per donor")
+
+## Is processing time confounded with study group? This matters for step 3.
+tt <- t.test(TimeElapsed ~ studyGroup,
+             data = cells %>% dplyr::distinct(donorId, studyGroup, TimeElapsed))
+cat(sprintf("\ndonor-level processing time: Ctrl %.1f h vs DS %.1f h (t-test p = %.3f)\n",
+            tt$estimate[1], tt$estimate[2], tt$p.value))
+print(with(cells %>% dplyr::distinct(donorId, studyGroup, TimeElapsed_binary),
+           table(studyGroup, TimeElapsed_binary)))
+
+## Fisher test on the group x fast/slow imbalance.
+print(fisher.test(with(cells %>% dplyr::distinct(donorId, studyGroup, TimeElapsed_binary),
+                       table(studyGroup, TimeElapsed_binary))))
+```
+
+Two features of this variable are worth noting before using it as a covariate:
+
+- **It is bimodal, not continuous.** With the default data the donors split into
+  4 processed in 2.0--5.4 h and 12 processed in 18.0--25.9 h, with nothing in
+  between. That is same-day versus overnight processing, so the 6 h cut sits in a
+  natural gap rather than slicing a continuum --- which makes
+  `TimeElapsed_binary` the better-behaved parameterization of the two.
+- **It is imbalanced across groups**, 3 Ctrl vs 1 DS in the fast bin. The Fisher
+  test above is not significant, but with 16 donors it has almost no power, and
+  the imbalance means a processing-time covariate will absorb some genuine
+  group signal. There is no way around this in the design: time is a
+  donor-level variable, so donor, group and processing time are partly
+  collinear (note `donorId` explains slightly more of PC2 than time does).
+  Adjusting is still the right call --- it makes the DE estimates conservative
+  rather than optimistic --- but the covariate should be reported, not hidden.
+
+# Normalization for visualization
+
+Raw counts stay raw for step 3. Here we build a separate log-CPM matrix purely
+to look at cell-level structure. Ig V/D/J/C genes are excluded by default ---
+otherwise the leading component simply separates isotypes and hides everything
+else.
+
+```{r normalize_viz}
+countsViz <- rawCounts[, cells$libid]
+
+keepGene <- rowMeans(edgeR::cpm(countsViz) > VIZ_MIN_CPM) >= VIZ_MIN_FRAC
+if (VIZ_EXCLUDE_IG) {
+  igGenes  <- geneAnno$ensgene[geneAnno$isIg]
+  keepGene <- keepGene & !(rownames(countsViz) %in% igGenes)
+}
+countsViz <- countsViz[keepGene, ]
+logCPM <- log2(edgeR::cpm(countsViz) + 1)
+
+## Highly variable genes, then PCA on centred (not scaled) log-CPM.
+geneVar <- matrixStats::rowVars(logCPM)
+hvg     <- names(sort(geneVar, decreasing = TRUE))[seq_len(min(VIZ_N_HVG, length(geneVar)))]
+pca     <- prcomp(t(logCPM[hvg, ]), center = TRUE, scale. = FALSE)
+pctVar  <- 100 * pca$sdev^2 / sum(pca$sdev^2)
+
+cat(sprintf("%d genes pass the expression filter, %d HVGs used for PCA\n",
+            nrow(countsViz), length(hvg)))
+cat(sprintf("variance explained: PC1 %.1f%%, PC2 %.1f%%, PC3 %.1f%%\n",
+            pctVar[1], pctVar[2], pctVar[3]))
+
+umap <- uwot::umap(pca$x[, seq_len(VIZ_N_PCS)], n_neighbors = UMAP_N_NEIGHBORS,
+                   min_dist = UMAP_MIN_DIST, seed = SEED)
+
+## Keep the first five PCs for the association table below.
+viz <- dplyr::bind_cols(
+  cells,
+  as.data.frame(pca$x[, 1:5]) %>% setNames(paste0("PC", 1:5)),
+  tibble(UMAP1 = umap[, 1], UMAP2 = umap[, 2]))
+```
+
+## What drives the leading components?
+
+Variance in each PC explained by candidate drivers, so the plots below can be
+read quantitatively rather than by eye.
+
+```{r pc_associations}
+drivers <- c("TimeElapsed", "TimeElapsed_binary", "studyGroup", "isotype",
+             "donorId", "libSize", "nGenes", "pctMito", "pctRibo", "plate")
+do.call(rbind, lapply(paste0("PC", 1:5), function(pc)
+  do.call(rbind, lapply(drivers, function(dv) {
+    if (!dv %in% names(viz) || dplyr::n_distinct(viz[[dv]], na.rm = TRUE) < 2)
+      return(NULL)
+    fit <- lm(reformulate(dv, response = pc), data = viz)
+    data.frame(PC = pc, driver = dv,
+               R2 = round(summary(fit)$r.squared, 3),
+               p = signif(anova(fit)[dv, "Pr(>F)"], 3))
+  })))) %>%
+  tidyr::pivot_wider(names_from = PC, values_from = c(R2, p)) %>%
+  dplyr::select(driver, dplyr::starts_with("R2"), dplyr::starts_with("p_")) %>%
+  kable(caption = "Variance explained (R2) and ANOVA p per PC")
+```
+
+## PCA and UMAP
+
+```{r viz_plots, fig.width=5.8, fig.height=4.4}
+plotEmbedding <- function(dat, colourBy, title = colourBy) {
+  pcaPlot <- ggplot(dat, aes(PC1, PC2, colour = .data[[colourBy]])) +
+    geom_point(size = 1.1, alpha = 0.85) +
+    labs(x = sprintf("PC1 (%.1f%%)", pctVar[1]), y = sprintf("PC2 (%.1f%%)", pctVar[2]),
+         colour = NULL, title = paste("PCA:", title)) +
+    theme_classic(base_size = 11)
+  umapPlot <- ggplot(dat, aes(UMAP1, UMAP2, colour = .data[[colourBy]])) +
+    geom_point(size = 1.1, alpha = 0.85) +
+    labs(colour = NULL, title = paste("UMAP:", title)) +
+    theme_classic(base_size = 11)
+  if (is.numeric(dat[[colourBy]])) {
+    pcaPlot  <- pcaPlot  + scale_colour_viridis_c()
+    umapPlot <- umapPlot + scale_colour_viridis_c()
+  }
+  print(pcaPlot); print(umapPlot)
+}
+
+plotEmbedding(viz, "TimeElapsed", "hours from draw to processing")
+plotEmbedding(viz %>% dplyr::mutate(TimeElapsed_binary = factor(TimeElapsed_binary)),
+              "TimeElapsed_binary", sprintf("processing time >= %d h", TIME_BINARY_CUT))
+plotEmbedding(viz, "studyGroup")
+plotEmbedding(viz %>% dplyr::mutate(isotype = tidyr::replace_na(isotype, "none")), "isotype")
+plotEmbedding(viz, "project", "donor")
+plotEmbedding(viz, "nGenes", "genes detected")
+```
+
+## Reading these plots
+
+With the default parameters the structure is unambiguous, and it matters for
+step 3:
+
+- **PC1 is sequencing depth**, not biology: `nGenes` explains ~83% of it
+  (isotype ~31%). Expected for full-length plate data and handled by
+  normalization in the DE model.
+- **PC2 is draw-to-processing time.** `TimeElapsed_binary` explains ~79% of PC2
+  and continuous `TimeElapsed` ~68%; the fast-processed donors form a visually
+  distinct band. This is the largest non-depth axis in the data.
+- **Study group shares that axis** (~18% of PC2). Processing time is therefore
+  partly confounded with DS vs Ctrl at the cell level, even though the
+  donor-level means are not significantly different (see the t-test above; with
+  only 16 donors that test has little power, so a non-significant result is not
+  reassurance).
+- **PC3 is isotype** (~40%), which is the biology the pseudobulk comparison
+  conditions on by analysing IgG and IgM separately.
+
+Practical consequence: include `TimeElapsed_binary` in the step 3 design. This
+also explains a result from the earlier audit --- HBB and HBA2, the strongest
+"DEGs" in the published cell-level analysis, are erythrocyte-contamination genes
+whose apparent DS-vs-Ctrl signal weakens once processing time is adjusted for.
+
+
+# Save for step 4
+
+```{r save}
+countsStep3 <- rawCounts[, cells$libid]
+stopifnot(all(countsStep3 %% 1 == 0), identical(colnames(countsStep3), cells$libid))
+
+saveRDS(list(counts = countsStep3, cellAnno = cells, geneAnno = geneAnno,
+             viz = viz %>% dplyr::select(libid, PC1:PC5, UMAP1, UMAP2),
+             pctVar = pctVar,
+             params = list(TIME_BINARY_CUT = TIME_BINARY_CUT,
+                           VIZ_EXCLUDE_IG = VIZ_EXCLUDE_IG, SEED = SEED),
+             sessionInfo = sessionInfo()),
+        file.path(OUT_DIR, "step3_cells_time_structure.rds"))
+write_csv(cells, file.path(OUT_DIR, "step3_cell_metadata.csv"))
+
+cat(sprintf("saved %d genes x %d cells (raw counts) to %s\n",
+            nrow(countsStep3), ncol(countsStep3),
+            file.path(OUT_DIR, "step3_cells_time_structure.rds")))
+
+## Cells available per donor x isotype -- this sets pseudobulk power in step 4.
+cells %>%
+  dplyr::filter(isotype %in% c("IGHG", "IGHM")) %>%
+  dplyr::count(studyGroup, project, isotype) %>%
+  tidyr::pivot_wider(names_from = isotype, values_from = n, values_fill = 0) %>%
+  dplyr::arrange(studyGroup, project) %>%
+  kable(caption = "Cells per donor for the IgG / IgM pseudobulk comparison")
+```
+
+# Where this goes next
+
+Step 4 pseudobulks these raw counts by donor x isotype and runs DESeq2 and
+limma with `~ studyGroup + TimeElapsed_binary`.

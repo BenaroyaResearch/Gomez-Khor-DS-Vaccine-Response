@@ -1,0 +1,41 @@
+
+Overlap Results
+
+Collection(s):	H
+# overlaps shown:	9
+# genesets in collections:	50
+# genes in comparison (n):	17
+# genes in universe (N):	43414
+
+Gene Set Name	# Genes in Gene Set (K)	Description	# Genes in Overlap (k)	k/K	p-value	FDR q-value
+HALLMARK_INTERFERON_GAMMA_RESPONSE	200	Genes up-regulated in response to IFNG [GeneID=3458].	4	0.0200	9.92E-7	4.96E-5
+HALLMARK_IL6_JAK_STAT3_SIGNALING	87	Genes up-regulated by IL6 [GeneID=3569] via STAT3 [GeneID=6774], e.g., during acute phase response.	3	0.0345	5.18E-6	1.29E-4
+HALLMARK_ALLOGRAFT_REJECTION	200	Genes up-regulated during transplant rejection.	3	0.0150	6.24E-5	7.81E-4
+HALLMARK_P53_PATHWAY	200	Genes involved in p53 pathways and networks.	3	0.0150	6.24E-5	7.81E-4
+HALLMARK_TGF_BETA_SIGNALING	54	Genes up-regulated in response to TGFB1 [GeneID=7040].	2	0.0370	2.04E-4	2.04E-3
+HALLMARK_APOPTOSIS	161	Genes mediating programmed cell death (apoptosis) by activation of caspases.	2	0.0124	1.79E-3	1.49E-2
+HALLMARK_INFLAMMATORY_RESPONSE	200	Genes defining inflammatory response.	2	0.0100	2.74E-3	1.52E-2
+HALLMARK_TNFA_SIGNALING_VIA_NFKB	200	Genes regulated by NF-kB in response to TNF [GeneID=7124].	2	0.0100	2.74E-3	1.52E-2
+HALLMARK_XENOBIOTIC_METABOLISM	200	Genes encoding proteins involved in processing of drugs and other xenobiotics.	2	0.0100	2.74E-3	1.52E-2
+
+
+Gene/Gene Set Overlap Matrix
+
+Entrez Gene Id	Gene Symbol	Gene Description	HALLMARK_INTERFERON_GAMMA_RESPONSE	HALLMARK_IL6_JAK_STAT3_SIGNALING	HALLMARK_ALLOGRAFT_REJECTION	HALLMARK_P53_PATHWAY	HALLMARK_TGF_BETA_SIGNALING	HALLMARK_APOPTOSIS	HALLMARK_INFLAMMATORY_RESPONSE	HALLMARK_TNFA_SIGNALING_VIA_NFKB	HALLMARK_XENOBIOTIC_METABOLISM
+355	FAS	Fas cell surface death receptor [Source:HGNC Symbol;Acc:HGNC:11920]	HALLMARK_INTERFERON_GAMMA_RESPONSE	HALLMARK_IL6_JAK_STAT3_SIGNALING	HALLMARK_ALLOGRAFT_REJECTION	HALLMARK_P53_PATHWAY		HALLMARK_APOPTOSIS			HALLMARK_XENOBIOTIC_METABOLISM
+5770	PTPN1	protein tyrosine phosphatase non-receptor type 1 [Source:HGNC Symbol;Acc:HGNC:9642]	HALLMARK_INTERFERON_GAMMA_RESPONSE	HALLMARK_IL6_JAK_STAT3_SIGNALING							
+3105	HLA-A	major histocompatibility complex, class I, A [Source:HGNC Symbol;Acc:HGNC:4931]	HALLMARK_INTERFERON_GAMMA_RESPONSE		HALLMARK_ALLOGRAFT_REJECTION						
+10628	TXNIP	thioredoxin interacting protein [Source:HGNC Symbol;Acc:HGNC:16952]	HALLMARK_INTERFERON_GAMMA_RESPONSE			HALLMARK_P53_PATHWAY		HALLMARK_APOPTOSIS			
+3460	IFNGR2	interferon gamma receptor 2 [Source:HGNC Symbol;Acc:HGNC:5440]		HALLMARK_IL6_JAK_STAT3_SIGNALING	HALLMARK_ALLOGRAFT_REJECTION		HALLMARK_TGF_BETA_SIGNALING		HALLMARK_INFLAMMATORY_RESPONSE	HALLMARK_TNFA_SIGNALING_VIA_NFKB	
+4814	NINJ1	ninjurin 1 [Source:HGNC Symbol;Acc:HGNC:7824]				HALLMARK_P53_PATHWAY				HALLMARK_TNFA_SIGNALING_VIA_NFKB	HALLMARK_XENOBIOTIC_METABOLISM
+51742	ARID4B	AT-rich interaction domain 4B [Source:HGNC Symbol;Acc:HGNC:15550]					HALLMARK_TGF_BETA_SIGNALING				
+1236	CCR7	C-C motif chemokine receptor 7 [Source:HGNC Symbol;Acc:HGNC:1608]							HALLMARK_INFLAMMATORY_RESPONSE		
+10600	USP16	ubiquitin specific peptidase 16 [Source:HGNC Symbol;Acc:HGNC:12614]									
+3043	HBB	hemoglobin subunit beta [Source:HGNC Symbol;Acc:HGNC:4827]									
+123720	WHAMM	WASP homolog associated with actin, golgi membranes and microtubules [Source:HGNC Symbol;Acc:HGNC:30493]									
+1386	ATF2	activating transcription factor 2 [Source:HGNC Symbol;Acc:HGNC:784]									
+3120	HLA-DQB2	major histocompatibility complex, class II, DQ beta 2 [Source:HGNC Symbol;Acc:HGNC:4945]									
+3512	JCHAIN	joining chain of multimeric IgA and IgM [Source:HGNC Symbol;Acc:HGNC:5713]									
+64092	SAMSN1	SAM domain, SH3 domain and nuclear localization signals 1 [Source:HGNC Symbol;Acc:HGNC:10528]									
+6651	SON	SON DNA and RNA binding protein [Source:HGNC Symbol;Acc:HGNC:11183]									
+7109	TRAPPC10	trafficking protein particle complex subunit 10 [Source:HGNC Symbol;Acc:HGNC:11868]									

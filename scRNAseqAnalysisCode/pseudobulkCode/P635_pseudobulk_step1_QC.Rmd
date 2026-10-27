@@ -1,0 +1,265 @@
+---
+title: "P635 pseudobulk analysis --- Step 1: raw counts and library QC"
+author: "Hannah DeBerg"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5)
+```
+
+# Purpose
+
+Step 1 of the donor-level pseudobulk analysis of the P635 spike-specific B cell
+data: read the **raw, un-normalized** counts, inspect library QC metrics, and
+apply the QC cuts. Later steps build on the object saved at the end.
+
+Two things to know about the data:
+
+- Plate-based SMART-Seq, so one sequencing library is one sorted cell, and
+  library-level RNA-seq metrics (alignment rate, coverage evenness) are
+  available per cell.
+- Counts come from `inputs/P635Data.Rdata` (the original `apird`
+  `getGeneCounts()` pull: integer counts, 58,302 Ensembl IDs x 864 libraries).
+  See `inputs/README.md` for provenance.
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(readr)
+library(ggplot2)
+library(knitr)
+library(annotables)   # grch38 gene annotation (Ensembl ID -> symbol, chromosome)
+```
+
+# Parameters
+
+Everything you might want to change lives in this chunk.
+
+```{r params}
+## --- Paths -------------------------------------------------------------------
+## All pipeline inputs live in inputs/ (see inputs/README.md for provenance), so
+## the analysis runs from a checkout without reaching into Box.
+INPUT_DIR <- "inputs"
+RDATA     <- file.path(INPUT_DIR, "P635Data.Rdata")
+OUT_DIR   <- "pseudobulk_clean_output"
+
+## --- QC cuts -----------------------------------------------------------------
+MIN_TOTAL_READS   <- 0.5e6   # fastq_total_reads
+MIN_PCT_ALIGNED   <- 70      # pct_aligned
+MAX_MEDIAN_CV_COV <- 1.0     # median_cv_coverage (lower = more even coverage)
+
+## Transcriptome composition is computed and saved for reference but not
+## filtered on: among libraries passing the cuts above, the worst values are
+## 13.9% mitochondrial and 426 genes detected.
+
+dir.create(OUT_DIR, showWarnings = FALSE)
+```
+
+# Read raw counts
+
+`counts` in the `.Rdata` is stored libraries-x-genes with flowcell-suffixed row
+names, so it is transposed to genes-x-libraries and the names reduced to `libid`.
+
+```{r load_counts}
+env <- new.env()
+load(RDATA, envir = env)          # provides: anno, metrics, counts, bcrs
+cat("objects in", basename(RDATA), ":", paste(ls(env), collapse = ", "), "\n")
+
+rawCounts <- t(as.matrix(env$counts))
+colnames(rawCounts) <- str_extract(colnames(rawCounts), "lib[0-9]+")
+
+## Sanity checks: these must hold for count-based DE downstream.
+stopifnot(!anyDuplicated(colnames(rawCounts)),
+          all(rawCounts %% 1 == 0),        # integer counts
+          min(rawCounts) >= 0)
+
+cat(sprintf("raw counts: %d genes x %d libraries; all integer, non-negative\n",
+            nrow(rawCounts), ncol(rawCounts)))
+```
+
+# Library and gene annotation
+
+```{r annotation}
+## One row per library: sample annotation joined to sequencing metrics.
+libAnno <- env$anno %>%
+  dplyr::select(libid, donorId, studyGroup, timePoint, sex, project,
+                sort, contentType, plate, sampleWell) %>%
+  dplyr::inner_join(
+    env$metrics %>%
+      dplyr::select(libid, fastq_total_reads, mapped_reads, pct_aligned,
+                    median_cv_coverage, percent_duplication),
+    by = "libid") %>%
+  dplyr::mutate(
+    median_cv_coverage = as.numeric(median_cv_coverage),
+    pct_aligned        = as.numeric(pct_aligned),
+    studyGroup         = factor(studyGroup, levels = c("TC", "DS")),
+    ## order donors numerically (P635-1, P635-2, ... not P635-1, P635-10)
+    project = factor(project, levels = paste0("P635-", sort(as.numeric(
+      str_remove(unique(project), "P635-")))))) %>%
+  dplyr::filter(libid %in% colnames(rawCounts))
+
+stopifnot(nrow(libAnno) == ncol(rawCounts))
+rawCounts <- rawCounts[, libAnno$libid]     # align column order to annotation
+
+## Gene annotation. Ensembl IDs are unversioned, so they join directly.
+geneAnno <- tibble(ensgene = rownames(rawCounts)) %>%
+  dplyr::left_join(annotables::grch38 %>%
+                     dplyr::distinct(ensgene, .keep_all = TRUE) %>%
+                     dplyr::select(ensgene, symbol, chr, biotype),
+                   by = "ensgene") %>%
+  dplyr::mutate(
+    isMito = !is.na(chr) & chr == "MT",
+    isRibo = !is.na(symbol) & str_detect(symbol, "^RP[SL][0-9]"),
+    isHb   = !is.na(symbol) & str_detect(symbol, "^HB[ABDEGQZ][0-9]?$"),
+    isIg   = !is.na(symbol) & str_detect(symbol,
+               "^IG[HKL](V|D|J|C)[0-9]|^IGH[ADEGM][0-9]?$|^IGKC$|^IGLC[0-9]$"))
+
+cat(sprintf("annotated %d of %d genes; %d mito, %d ribosomal, %d hemoglobin, %d Ig V/D/J/C\n",
+            sum(!is.na(geneAnno$symbol)), nrow(geneAnno), sum(geneAnno$isMito),
+            sum(geneAnno$isRibo), sum(geneAnno$isHb), sum(geneAnno$isIg)))
+
+kable(libAnno %>% dplyr::count(studyGroup, project, donorId, name = "nLibraries"),
+      caption = "Libraries per donor")
+```
+
+# Compute QC metrics
+
+Alignment metrics come from the pipeline; the rest are computed from the raw
+count matrix.
+
+```{r qc_metrics}
+fracOf <- function(idx) Matrix::colSums(rawCounts[idx, , drop = FALSE]) /
+                        Matrix::colSums(rawCounts) * 100
+
+qc <- libAnno %>%
+  dplyr::mutate(
+    libSize    = Matrix::colSums(rawCounts),
+    nGenes     = Matrix::colSums(rawCounts > 0),
+    pctMito    = fracOf(geneAnno$isMito),
+    pctRibo    = fracOf(geneAnno$isRibo),
+    pctHb      = fracOf(geneAnno$isHb),
+    pctIg      = fracOf(geneAnno$isIg),
+    pctTopGene = apply(rawCounts, 2, max) / Matrix::colSums(rawCounts) * 100)
+
+qcVars <- c("fastq_total_reads", "pct_aligned", "median_cv_coverage",
+            "percent_duplication", "libSize", "nGenes", "pctMito", "pctRibo",
+            "pctHb", "pctIg", "pctTopGene")
+
+## Distribution of every QC metric, overall and by study group.
+qc %>%
+  dplyr::select(studyGroup, dplyr::all_of(qcVars)) %>%
+  tidyr::pivot_longer(-studyGroup, names_to = "metric") %>%
+  dplyr::group_by(metric, studyGroup) %>%
+  dplyr::summarise(min = min(value), q25 = quantile(value, .25),
+                   median = median(value), q75 = quantile(value, .75),
+                   max = max(value), .groups = "drop") %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ signif(.x, 3))) %>%
+  kable(caption = "QC metric distributions by study group")
+```
+
+# QC plots
+
+```{r plot_total_reads, fig.height=3.5}
+ggplot(qc, aes(reorder(libid, fastq_total_reads), fastq_total_reads / 1e6,
+               fill = studyGroup)) +
+  geom_col() +
+  geom_hline(yintercept = MIN_TOTAL_READS / 1e6, linetype = "dashed") +
+  scale_fill_manual(values = c(TC = "steelblue", DS = "firebrick")) +
+  labs(x = "library (ordered by depth)", y = "total reads (millions)",
+       fill = NULL, title = "Sequencing depth per library",
+       subtitle = paste0("dashed line = cut at ", MIN_TOTAL_READS / 1e6, "M reads")) +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+```
+
+```{r plot_align_cv}
+ggplot(qc, aes(median_cv_coverage, pct_aligned, colour = studyGroup)) +
+  geom_point(size = 1.6, alpha = 0.8) +
+  geom_hline(yintercept = MIN_PCT_ALIGNED, linetype = "dashed") +
+  geom_vline(xintercept = MAX_MEDIAN_CV_COV, linetype = "dashed") +
+  scale_colour_manual(values = c(TC = "steelblue", DS = "firebrick")) +
+  ylim(0, 100) +
+  labs(x = "median CV of coverage (lower is better)", y = "percent aligned",
+       colour = NULL, title = "Alignment rate vs coverage evenness",
+       subtitle = "libraries in the upper-left quadrant pass") +
+  theme_classic(base_size = 11)
+```
+
+# Apply QC cuts
+
+```{r apply_cuts}
+qc <- qc %>%
+  dplyr::mutate(
+    passReads = fastq_total_reads  >  MIN_TOTAL_READS,
+    passAlign = pct_aligned        >  MIN_PCT_ALIGNED,
+    passCV    = median_cv_coverage <  MAX_MEDIAN_CV_COV,
+    qcPass    = passReads & passAlign & passCV)
+
+## How many libraries does each individual cut remove?
+tibble(cut = c("total reads", "percent aligned", "median CV coverage"),
+       threshold = c(paste0("> ", MIN_TOTAL_READS / 1e6, "M"),
+                     paste0("> ", MIN_PCT_ALIGNED, "%"),
+                     paste0("< ", MAX_MEDIAN_CV_COV)),
+       nFailing = c(sum(!qc$passReads), sum(!qc$passAlign), sum(!qc$passCV))) %>%
+  kable(caption = "Libraries failing each cut (cuts overlap)")
+
+cat(sprintf("\n%d of %d libraries pass QC (%.0f%%)\n",
+            sum(qc$qcPass), nrow(qc), 100 * mean(qc$qcPass)))
+
+## Retained libraries per donor -- this is what limits pseudobulk power later.
+qc %>%
+  dplyr::group_by(studyGroup, project, donorId) %>%
+  dplyr::summarise(nBefore = dplyr::n(), nAfter = sum(qcPass), .groups = "drop") %>%
+  dplyr::arrange(studyGroup, project) %>%
+  kable(caption = "Libraries per donor before and after QC")
+
+## Failing libraries, for the record.
+qc %>% dplyr::filter(!qcPass) %>%
+  dplyr::select(libid, donorId, project, studyGroup, fastq_total_reads,
+                pct_aligned, median_cv_coverage, nGenes, pctMito) %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ signif(.x, 3))) %>%
+  kable(caption = "Libraries failing QC")
+```
+
+# Save for step 2
+
+```{r save}
+countsQC <- rawCounts[, qc$libid[qc$qcPass]]
+qcPassing <- qc %>% dplyr::filter(qcPass)
+
+saveRDS(list(counts = countsQC, libAnno = qcPassing, geneAnno = geneAnno,
+             params = list(MIN_TOTAL_READS = MIN_TOTAL_READS,
+                           MIN_PCT_ALIGNED = MIN_PCT_ALIGNED,
+                           MAX_MEDIAN_CV_COV = MAX_MEDIAN_CV_COV),
+             sessionInfo = sessionInfo()),
+        file.path(OUT_DIR, "step1_counts_qc.rds"))
+write_csv(qc, file.path(OUT_DIR, "step1_library_qc_metrics.csv"))
+
+cat(sprintf("saved %d genes x %d libraries to %s\n",
+            nrow(countsQC), ncol(countsQC),
+            file.path(OUT_DIR, "step1_counts_qc.rds")))
+```
+
+# Where this goes next
+
+Step 2 loads the BCR calls, counts heavy and light chains, builds Supplemental
+Figures S5B--S5D, removes doublets, and assigns each cell an IgH isotype. Two
+things to carry over:
+
+- The `bcrs` object inside `P635Data.Rdata` has only **8 rows** and is not
+  usable. Isotype calls come from the MiXCR summary in `inputs/`.
+- Doublet removal (`numheavy >= 2 | numlight >= 3`) happens there, once heavy and
+  light chain counts per library are available.
+
+The per-donor retention table above is worth a second look before going further:
+donor-level pseudobulk power is set by how many cells each donor contributes to
+each isotype.

@@ -1,0 +1,947 @@
+---
+title: "P635 pseudobulk analysis --- Step 2: BCR calls, isotypes, processing time, cell-level structure"
+author: "Hannah DeBerg"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5)
+```
+
+# Purpose
+
+Step 2 of the clean donor-level pseudobulk analysis. Picks up the 806
+QC-passing libraries from step 1 and:
+
+1. loads the MiXCR BCR calls and counts heavy and light chains,
+2. builds **Supplemental Figures S5B and S5C**,
+3. removes doublets,
+4. assigns each cell an IgH isotype from its heavy chain, the input to
+   **main text Figure 5A** (drawn by `figure_panels/Fig5A_isotype_frequencies.R`),
+5. calls clonal expansion following the published methods and builds
+   **Supplemental Figure S5D**, and
+6. computes repertoire diversity metrics answering **reviewer comment 8**.
+
+Every figure panel gets a source-data table saved alongside it (JCI Insight
+requires per-panel source data).
+
+Scope: BCR chain analysis and the figures that depend on it. Draw-to-processing
+time, normalization and the cell-level PCA/UMAP are in step 3; pseudobulk
+differential expression is in step 4. Raw counts pass through untouched.
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(readr)
+library(readxl)
+library(ggplot2)
+library(knitr)
+library(shazam)    # distToNearest / findThreshold (Immcantation)
+library(alakazam)  # alphaDiversity (Immcantation)
+library(stringdist)
+```
+
+# Parameters
+
+```{r params}
+## --- Paths -------------------------------------------------------------------
+## All pipeline inputs live in inputs/ (see inputs/README.md for provenance).
+INPUT_DIR   <- "inputs"
+MIXCR_CSV   <- file.path(INPUT_DIR, "Mixcr_summary_updated_with_Nucleotidesequences_1stAug2025_PseudogeneFiltered.csv")
+EXCLUDE_CSV <- file.path(INPUT_DIR, "QC_libids_HCLC_tobeExcluded_Aug2025.csv")
+
+STEP1_RDS    <- file.path("pseudobulk_clean_output", "step1_counts_qc.rds")
+STEP1_QC_CSV <- file.path("pseudobulk_clean_output", "step1_library_qc_metrics.csv")
+OUT_DIR      <- "pseudobulk_clean_output"
+FIG_DIR      <- file.path(OUT_DIR, "figures")
+SRC_DIR      <- file.path(OUT_DIR, "figure_source_data")   # JCI source-data tables
+
+## --- Doublet definition ------------------------------------------------------
+MIN_HEAVY_DOUBLET <- 2   # >= this many heavy chains => doublet
+MIN_LIGHT_DOUBLET <- 3   # >= this many light chains => doublet
+
+## --- Clonal expansion (Supplemental Figure S5D) ------------------------------
+## Follows the published methods: per donor and chain type, nearest-neighbour
+## distances between CDR3 nucleotide sequences via shazam::distToNearest
+## (Hamming, length-normalized, grouped by V/J gene and junction length), then
+## "Expanded" = EITHER
+##   (i)  nearest-neighbour distance < CLONE_DIST_THRESHOLD, OR
+##   (ii) identical V gene, J gene, C gene and CDR3 nucleotide sequence shared
+##        by at least CLONE_MIN_SIZE cells in that donor.
+CLONE_DIST_THRESHOLD <- 0.193   # the published threshold
+CLONE_MIN_SIZE       <- 2
+
+## Which chain type decides whether a CELL is expanded. Clonality is defined by
+## the heavy chain: light-chain CDR3s are short and convergent, so unrelated
+## cells routinely share one (see the sensitivity table below).
+CLONE_CHAINS           <- "heavy"
+CLONE_IDENTICAL_CHAINS <- "heavy"   # scope of criterion (ii)
+
+## Denominator for the per-donor proportion.
+##   "assessed"  : cells carrying a chain of the relevant type (default; a cell
+##                 with no heavy chain cannot be called either way)
+##   "all_cells" : all 801 cells, counting unassessable cells as not expanded
+CLONE_DENOMINATOR <- "assessed"
+
+## Report what findThreshold() derives from these data next to the 0.193 used in
+## the methods. Informational only; CLONE_DIST_THRESHOLD is what gets applied.
+REPORT_FINDTHRESHOLD <- TRUE
+
+## --- Repertoire metrics (reviewer comment 8) ---------------------------------
+DIVERSITY_NBOOT <- 200   # bootstrap replicates for alakazam::alphaDiversity
+RAREFY_REPS     <- 200   # resampling replicates for rarefied metrics
+
+## The metrics reported in both the statistics table and the figure. Depth-driven
+## metrics (raw Shannon, Hill numbers, group counts) are computed for reference
+## but not reported, because they correlate with cells sequenced at r ~ 1.
+REPORT_METRICS <- c("rarefiedRichness", "rarefiedHill1", "evenness",
+                    "pctCellsInExpandedGroups", "top1Share", "vGeneShannon")
+
+SEED <- 42
+
+## --- Manuscript figure panels ------------------------------------------------
+GROUP_COLORS <- c(TC = "blue", DS = "red")   # as published
+
+## Which libraries feed BOTH Supplemental Figure S5B and S5C. One shared
+## parameter on purpose: the two panels describe the same cells, so they are
+## drawn on the same set.
+##   "qc_passing"    : the 806 libraries passing step 1 QC (default; upstream of
+##                     the doublet cut, so the doublets are visible in panel C)
+##   "post_doublet"  : the 801 analysis cells
+##   "all_libraries" : all 864 sequenced libraries
+S5_LIBRARY_SET <- "qc_passing"
+
+set.seed(SEED)
+for (d in c(OUT_DIR, FIG_DIR, SRC_DIR)) dir.create(d, showWarnings = FALSE)
+```
+
+# Load step 1
+
+```{r load_step1}
+step1     <- readRDS(STEP1_RDS)
+rawCounts <- step1$counts        # raw integer counts, genes x libraries
+libAnno   <- step1$libAnno       # one row per QC-passing library
+geneAnno  <- step1$geneAnno
+
+cat(sprintf("step 1: %d genes x %d QC-passing libraries\n",
+            nrow(rawCounts), ncol(rawCounts)))
+```
+
+# BCR calls and chain counts
+
+MiXCR rows are one chain per row. Two filters are applied before counting:
+the prior analyst's manual exclusion list (matched on `libid` +
+`full_nt_sequence`), and dropping any chain that is neither heavy (IGH) nor
+light (IGK/IGL).
+
+```{r load_bcrs}
+bcrsRaw <- read_csv(MIXCR_CSV, show_col_types = FALSE)
+exclude <- read_csv(EXCLUDE_CSV, show_col_types = FALSE, name_repair = "minimal") %>%
+  dplyr::select(libid, full_nt_sequence) %>%
+  dplyr::filter(!is.na(libid))
+
+## Classified but NOT yet restricted to QC-passing libraries, so that
+## S5_LIBRARY_SET can select any of the three library sets below.
+bcrsClassified <- bcrsRaw %>%
+  dplyr::anti_join(exclude, by = c("libid", "full_nt_sequence")) %>%
+  dplyr::mutate(chain = dplyr::case_when(
+    str_detect(v_gene, "IGH")      ~ "heavy",
+    str_detect(v_gene, "IGK|IGL")  ~ "light",
+    TRUE                           ~ "other")) %>%
+  dplyr::filter(chain != "other")
+
+bcrs <- bcrsClassified %>% dplyr::filter(libid %in% libAnno$libid)
+
+cat(sprintf("MiXCR rows: %d -> %d after exclusion list, chain filter, and QC libraries\n",
+            nrow(bcrsRaw), nrow(bcrs)))
+```
+
+```{r chain_counts}
+chainCounts <- bcrs %>%
+  dplyr::count(libid, chain) %>%
+  tidyr::pivot_wider(names_from = chain, values_from = n, values_fill = 0)
+
+libAnno <- libAnno %>%
+  dplyr::left_join(chainCounts, by = "libid") %>%
+  dplyr::mutate(
+    numheavy = tidyr::replace_na(heavy, 0),
+    numlight = tidyr::replace_na(light, 0),
+    bcrGroup = dplyr::case_when(numheavy > 0 & numlight > 0 ~ "both",
+                                numheavy > 0                ~ "heavy only",
+                                numlight > 0                ~ "light only",
+                                TRUE                        ~ "no bcr"),
+    is_doublet = numheavy >= MIN_HEAVY_DOUBLET | numlight >= MIN_LIGHT_DOUBLET) %>%
+  dplyr::select(-heavy, -light)
+
+kable(libAnno %>% dplyr::count(numheavy, numlight, is_doublet),
+      caption = "Heavy / light chain counts per library")
+kable(libAnno %>% dplyr::count(bcrGroup, name = "nLibraries"),
+      caption = "BCR recovery")
+
+cat(sprintf("\nflagged as doublets: %d | would remain after removal: %d\n",
+            sum(libAnno$is_doublet), sum(!libAnno$is_doublet)))
+```
+
+The doublet cut is applied further down, *after* the supplemental panels, so
+those panels can show the chain-recovery distribution that motivates it.
+
+# Manuscript figure panels
+
+Repeating the upstream supplemental panels from this pipeline, with a source-data
+table saved alongside each one (JCI Insight requires per-panel source data).
+
+Both panels are drawn on the **same** library set (`S5_LIBRARY_SET`, default the
+806 libraries passing step 1 QC) and sit **upstream of the doublet cut**. That
+ordering is deliberate: panel C's whole point is the chain-recovery
+distribution, and the cells carrying two or more heavy chains are exactly the
+ones the doublet rule removes, so drawing it after removal would delete the
+evidence for the cut. Panel B on the same set then describes the same cells.
+
+Neither panel depends on the isotype-call correction above --- both count cells
+and chains, not isotypes --- so they are a clean end-to-end check on the
+pipeline before we rely on it for anything new.
+
+```{r fig_helpers}
+## All 864 sequenced libraries with their QC verdict, from step 1.
+allLibs <- read_csv(STEP1_QC_CSV, show_col_types = FALSE) %>%
+  dplyr::select(libid, donorId, project, studyGroup, qcPass) %>%
+  dplyr::mutate(studyGroup = factor(studyGroup, levels = c("TC", "DS")))
+
+## Donors ordered by group, then numerically within group.
+donorLevels <- allLibs %>%
+  dplyr::distinct(project, studyGroup) %>%
+  dplyr::mutate(num = as.numeric(str_remove(project, "P635-"))) %>%
+  dplyr::arrange(studyGroup, num) %>%
+  dplyr::pull(project)
+
+saveSource <- function(dat, panel, description) {
+  path <- file.path(SRC_DIR, sprintf("%s.csv", panel))
+  write_csv(dat, path)
+  cat(sprintf("source data: %-42s %4d rows  (%s)\n", basename(path), nrow(dat), description))
+  invisible(path)
+}
+savePanel <- function(plot, panel, width = 6.5, height = 4) {
+  ggsave(file.path(FIG_DIR, sprintf("%s.pdf", panel)), plot, width = width, height = height)
+  ggsave(file.path(FIG_DIR, sprintf("%s.png", panel)), plot, width = width, height = height,
+         dpi = 300, bg = "white")
+  invisible(plot)
+}
+```
+
+## The library set for both panels
+
+```{r fig_library_set}
+s5Libs <- switch(S5_LIBRARY_SET,
+                 qc_passing    = allLibs %>% dplyr::filter(qcPass),
+                 post_doublet  = allLibs %>% dplyr::filter(libid %in%
+                                   libAnno$libid[!libAnno$is_doublet]),
+                 all_libraries = allLibs,
+                 stop("unknown S5_LIBRARY_SET: ", S5_LIBRARY_SET))
+cat(sprintf("panels S5B and S5C both drawn on %d libraries (%s)\n",
+            nrow(s5Libs), S5_LIBRARY_SET))
+```
+
+Supplemental Figure 7 panels B, C, D and E are **drawn** by the scripts in
+`figure_panels/`, which also write their source-data tables; the chunks below
+keep the analysis and the inline summaries only. Run them after this notebook:
+
+```
+Rscript figure_panels/SupplFig7B_cells_per_donor.R
+Rscript figure_panels/SupplFig7C_chains_per_cell.R
+Rscript figure_panels/SupplFig7D_clonal_expansion.R
+Rscript figure_panels/SupplFig7E_repertoire_metrics.R
+```
+
+(The supplemental figure was renumbered from S5 to S7 between manuscript
+versions; the object names below still carry the old numbering.)
+
+## Supplemental Figure S5B --- cells sequenced per donor
+
+```{r fig_S5B, fig.width=6.5, fig.height=4}
+s5b <- s5Libs %>%
+  dplyr::count(studyGroup, project, donorId, name = "nCells") %>%
+  dplyr::mutate(project = factor(project, levels = donorLevels)) %>%
+  dplyr::arrange(project)
+
+pS5B <- ggplot(s5b, aes(project, nCells, fill = studyGroup)) +
+  geom_col() +
+  scale_fill_manual(values = GROUP_COLORS) +
+  labs(x = "donor", y = "number of cells", fill = NULL,
+       title = "Supplemental Figure S5B: cells sequenced per donor",
+       subtitle = sprintf("%s (n = %d libraries)", S5_LIBRARY_SET, nrow(s5Libs))) +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(pS5B)
+
+kable(s5b, caption = "Source data, Supplemental Figure S5B")
+cat(sprintf("total cells: %d\n", sum(s5b$nCells)))
+```
+
+## Supplemental Figure S5C --- heavy and light chains recovered per cell
+
+Chain counts per cell. With the default library set this is before doublet
+removal, so the cells with two or more heavy chains --- the ones the doublet rule
+removes --- are visible here.
+
+```{r fig_S5C, fig.width=7, fig.height=3.8}
+s5cCounts <- bcrsClassified %>%
+  dplyr::filter(libid %in% s5Libs$libid) %>%
+  dplyr::count(libid, chain) %>%
+  tidyr::pivot_wider(names_from = chain, values_from = n, values_fill = 0)
+
+s5c <- s5Libs %>%
+  dplyr::left_join(s5cCounts, by = "libid") %>%
+  dplyr::mutate(numheavy = tidyr::replace_na(heavy, 0),
+                numlight = tidyr::replace_na(light, 0)) %>%
+  dplyr::select(libid, donorId, project, studyGroup, numheavy, numlight)
+
+pS5C <- ggplot(s5c, aes(numlight, numheavy, colour = studyGroup)) +
+  geom_jitter(width = 0.2, height = 0.2, alpha = 0.6, size = 0.9) +
+  facet_wrap(~ studyGroup) +
+  scale_colour_manual(values = GROUP_COLORS, guide = "none") +
+  scale_x_continuous(breaks = 0:max(s5c$numlight)) +
+  scale_y_continuous(breaks = 0:max(s5c$numheavy)) +
+  labs(x = "# light chains", y = "# heavy chains",
+       title = "Supplemental Figure S5C: chains recovered per cell",
+       subtitle = sprintf("%s (n = %d libraries)", S5_LIBRARY_SET, nrow(s5c))) +
+  theme_bw(base_size = 11)
+print(pS5C)
+
+```
+
+```{r fig_S5C_tables}
+## Exact counts behind the jitter, which the plot itself cannot convey.
+s5cCrossTab <- s5c %>%
+  dplyr::count(studyGroup, numheavy, numlight, name = "nCells") %>%
+  dplyr::arrange(studyGroup, numheavy, numlight)
+kable(s5cCrossTab %>%
+        tidyr::pivot_wider(names_from = numlight, values_from = nCells, values_fill = 0,
+                           names_prefix = "light_"),
+      caption = "Cells per heavy x light chain combination")
+
+## Per-donor chain totals.
+s5cPerDonor <- s5c %>%
+  dplyr::group_by(studyGroup, project, donorId) %>%
+  dplyr::summarise(nCells = dplyr::n(), heavyChains = sum(numheavy),
+                   lightChains = sum(numlight), .groups = "drop") %>%
+  dplyr::mutate(project = factor(project, levels = donorLevels)) %>%
+  dplyr::arrange(project)
+kable(s5cPerDonor, caption = "Source data, Supplemental Figure S5C (per-donor totals)")
+```
+
+# Doublet removal
+
+With the supplemental panels drawn, apply the cut. Everything downstream --- the
+isotype assignment, the embeddings, and the pseudobulk in step 3 --- uses this
+set.
+
+```{r remove_doublets}
+cells <- libAnno %>% dplyr::filter(!is_doublet)
+cat(sprintf("doublets removed: %d | cells retained: %d\n",
+            sum(libAnno$is_doublet), nrow(cells)))
+kable(libAnno %>% dplyr::filter(is_doublet) %>%
+        dplyr::select(libid, donorId, project, studyGroup, numheavy, numlight),
+      caption = "Libraries removed as doublets")
+```
+
+# Isotype assignment
+
+A cell carries at most one heavy chain after doublet removal, so the IgH isotype
+is read directly off it. Cells with light chains only get `NA` --- they have no
+IgH isotype to assign.
+
+```{r assign_isotype}
+cells <- cells %>%
+  dplyr::left_join(
+    bcrs %>%
+      dplyr::filter(libid %in% cells$libid, chain == "heavy") %>%
+      dplyr::group_by(libid) %>% dplyr::slice(1) %>% dplyr::ungroup() %>%
+      dplyr::transmute(libid, isotype = str_extract(c_gene, "^IGH[ADGME]")),
+    by = "libid")
+
+kable(cells %>% dplyr::count(isotype, name = "nCells") %>% dplyr::arrange(dplyr::desc(nCells)),
+      caption = "Isotype distribution")
+kable(cells %>% dplyr::count(studyGroup, isotype) %>%
+        tidyr::pivot_wider(names_from = studyGroup, values_from = n, values_fill = 0),
+      caption = "Isotype by study group")
+nHeavy <- dplyr::n_distinct(bcrs$libid[bcrs$chain == "heavy" & bcrs$libid %in% cells$libid])
+cat(sprintf("cells with an assigned isotype: %d of %d\n", sum(!is.na(cells$isotype)), nrow(cells)))
+cat(sprintf("cells carrying a heavy chain:   %d (the difference had a heavy chain with no parseable C gene)\n",
+            nHeavy))
+```
+
+# Main text Figure 5A --- isotype frequencies per donor
+
+The panel and its JCI Insight source-data tables are built by
+`figure_panels/Fig5A_isotype_frequencies.R`, which reads the
+`step2_cell_metadata.csv` written below. Keeping the drawing out of this
+notebook means one script owns each panel's files; run it after this notebook:
+
+```
+Rscript figure_panels/Fig5A_isotype_frequencies.R
+```
+
+That script computes, per donor, the percentage of isotype-assignable cells
+carrying each IgH isotype. Cells with no heavy chain, or a heavy chain with no
+parseable C gene, are excluded from numerator and denominator alike, and the
+per-donor denominator is written to the source table so any percentage can be
+recomputed. It asserts that each donor's four percentages sum to 100 --- the
+four plotted isotypes are the only ones called in these data, so anything else
+means the numerators and the denominator came from different cell sets.
+
+The four percentages are compositional, so the four tests are not independent.
+The script reports the raw p-values from both a Welch t-test and a Wilcoxon
+rank-sum test for every isotype, and can additionally apply Benjamini-Hochberg
+across the four isotypes of the panel (valid here under positive dependence).
+
+# Supplemental Figure S5D --- clonal expansion
+
+Drawn on the **801-cell** post-doublet set, since a doublet would create a
+spurious pairing.
+
+This follows the published methods: nearest-neighbour CDR3 nucleotide distances
+per donor and chain type (`shazam::distToNearest`, Hamming model,
+length-normalized, grouped by V/J gene and junction length), then two
+complementary criteria for calling a sequence expanded --- a nearest neighbour
+closer than the distance threshold, or an identical V/J/C/CDR3-nt sequence
+shared with another cell in the same donor.
+
+## One sequence per cell per chain
+
+```{r clone_sequences}
+## distToNearest finds each sequence's nearest neighbour within its group. If a
+## cell contributed two chain rows, the cell would be its own neighbour, so
+## reduce to one sequence per cell per chain type first.
+cloneSeqs <- bcrs %>%
+  dplyr::filter(libid %in% cells$libid, !is.na(cdr3_nt_sequence), cdr3_nt_sequence != "") %>%
+  dplyr::group_by(libid, chain) %>% dplyr::slice(1) %>% dplyr::ungroup() %>%
+  dplyr::left_join(cells %>% dplyr::select(libid, donorId, project, studyGroup, isotype),
+                   by = "libid") %>%
+  dplyr::transmute(sequence_id = paste0(libid, "_", chain), libid, donorId, project,
+                   studyGroup, isotype, chain,
+                   locus  = str_sub(v_gene, 1, 3),
+                   v_call = v_gene, j_call = j_gene, c_call = c_gene,
+                   ## amino-acid CDR3 kept for readable tables; `junction` is
+                   ## the nucleotide sequence the distance model operates on
+                   cdr3_aa = junction,
+                   junction = cdr3_nt_sequence)
+
+cat(sprintf("sequences: %d (heavy %d, light %d) from %d cells\n",
+            nrow(cloneSeqs), sum(cloneSeqs$chain == "heavy"),
+            sum(cloneSeqs$chain == "light"), dplyr::n_distinct(cloneSeqs$libid)))
+```
+
+## Nearest-neighbour distances
+
+```{r clone_distances}
+## Computed separately for each donor and chain type, as in the methods.
+cloneDist <- cloneSeqs %>%
+  dplyr::group_split(project, chain) %>%
+  lapply(function(d) {
+    if (nrow(d) < 2) { d$dist_nearest <- NA_real_; return(d) }
+    suppressWarnings(suppressMessages(tryCatch(
+      distToNearest(as.data.frame(d), sequenceColumn = "junction",
+                    vCallColumn = "v_call", jCallColumn = "j_call",
+                    model = "ham", normalize = "len", nproc = 1,
+                    locusColumn = "locus", locusValues = unique(d$locus),
+                    onlyHeavy = FALSE, keepVJLgroup = FALSE),
+      error = function(e) { d$dist_nearest <- NA_real_; d })))
+  }) %>%
+  dplyr::bind_rows()
+
+cat(sprintf("distances computed for %d of %d sequences (a sequence needs another with the same V, J and junction length in that donor)\n",
+            sum(!is.na(cloneDist$dist_nearest)), nrow(cloneDist)))
+
+if (REPORT_FINDTHRESHOLD) {
+  for (m in c("density", "gmm")) {
+    th <- suppressWarnings(tryCatch(
+      findThreshold(cloneDist$dist_nearest[!is.na(cloneDist$dist_nearest)], method = m),
+      error = function(e) NULL))
+    cat(sprintf("findThreshold(%-7s) on these data: %s | applied threshold: %.3f\n", m,
+                if (!is.null(th) && !is.na(th@threshold)) sprintf("%.3f", th@threshold) else "not returned",
+                CLONE_DIST_THRESHOLD))
+  }
+}
+
+ggplot(cloneDist %>% dplyr::filter(!is.na(dist_nearest)),
+       aes(dist_nearest, fill = chain)) +
+  geom_histogram(bins = 40, alpha = 0.7, position = "identity") +
+  geom_vline(xintercept = CLONE_DIST_THRESHOLD, linetype = "dashed") +
+  labs(x = "nearest-neighbour CDR3 nt distance (length-normalized Hamming)",
+       y = "sequences", fill = NULL,
+       title = "Nearest-neighbour distance distribution",
+       subtitle = sprintf("dashed line = applied threshold %.3f", CLONE_DIST_THRESHOLD)) +
+  theme_classic(base_size = 11)
+```
+
+## Applying the two criteria
+
+```{r clone_criteria}
+callExpansion <- function(dist_threshold = CLONE_DIST_THRESHOLD,
+                          chains = CLONE_CHAINS, minSize = CLONE_MIN_SIZE,
+                          requireCDR3 = TRUE, denominator = CLONE_DENOMINATOR,
+                          identicalChains = CLONE_IDENTICAL_CHAINS) {
+  key <- if (requireCDR3) c("v_call", "j_call", "c_call", "junction") else
+                          c("v_call", "j_call", "c_call")
+  seqLevel <- cloneDist %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(c("project", key)))) %>%
+    dplyr::mutate(nCellsIdentical = dplyr::n_distinct(libid)) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(critDistance  = !is.na(dist_nearest) & dist_nearest < dist_threshold,
+                  critIdentical = nCellsIdentical >= minSize,
+                  expandedSeq   = critDistance | critIdentical)
+  ## The two criteria are scoped independently, so a cell can qualify by a
+  ## heavy-chain distance match or by an identical sequence on either chain.
+  inScope <- function(scope) if (scope == "heavy") seqLevel$chain == "heavy" else
+                             rep(TRUE, nrow(seqLevel))
+  distScope  <- inScope(chains)
+  identScope <- inScope(identicalChains)
+  cellLevel <- seqLevel %>%
+    dplyr::mutate(hitDistance  = critDistance  & distScope,
+                  hitIdentical = critIdentical & identScope) %>%
+    dplyr::group_by(libid) %>%
+    dplyr::summarise(byDistance  = any(hitDistance),
+                     byIdentical = any(hitIdentical),
+                     expanded    = any(hitDistance) | any(hitIdentical),
+                     .groups = "drop")
+  ## "assessed" = cells carrying a chain of the type the distance criterion uses.
+  assessable <- unique(seqLevel$libid[distScope])
+  out <- if (denominator == "all_cells") {
+    cells %>% dplyr::left_join(cellLevel, by = "libid") %>%
+      dplyr::mutate(dplyr::across(c(byDistance, byIdentical, expanded),
+                                  ~ tidyr::replace_na(.x, FALSE)))
+  } else {
+    cells %>% dplyr::filter(libid %in% assessable) %>%
+      dplyr::left_join(cellLevel, by = "libid") %>%
+      dplyr::mutate(dplyr::across(c(byDistance, byIdentical, expanded),
+                                  ~ tidyr::replace_na(.x, FALSE)))
+  }
+  list(seqLevel = seqLevel, cells = out)
+}
+
+expansion <- callExpansion()
+seqLevel  <- expansion$seqLevel
+cellExp   <- expansion$cells
+
+cat(sprintf("criterion (i) distance < %.3f: %d sequences | criterion (ii) identical V/J/C/CDR3: %d | either: %d\n",
+            CLONE_DIST_THRESHOLD, sum(seqLevel$critDistance), sum(seqLevel$critIdentical),
+            sum(seqLevel$expandedSeq)))
+cat(sprintf("cells assessed (%s chain): %d of %d | expanded: %d (%.1f%%)\n",
+            CLONE_CHAINS, nrow(cellExp), nrow(cells), sum(cellExp$expanded),
+            100 * mean(cellExp$expanded)))
+cat(sprintf("  by distance criterion: %d | by identity criterion (%s chain): %d | both: %d\n",
+            sum(cellExp$byDistance), CLONE_IDENTICAL_CHAINS, sum(cellExp$byIdentical),
+            sum(cellExp$byDistance & cellExp$byIdentical)))
+
+saveSource(seqLevel %>% dplyr::select(sequence_id, libid, project, studyGroup, chain,
+                                      v_call, j_call, c_call, junction, dist_nearest,
+                                      nCellsIdentical, critDistance, critIdentical, expandedSeq),
+           "SupplFig5D_sequence_level", "one row per cell per chain, with distances")
+```
+
+## The panel
+
+```{r fig_S5D, fig.width=4.6, fig.height=4.2}
+s5d <- cellExp %>%
+  dplyr::group_by(studyGroup, project, donorId) %>%
+  dplyr::summarise(nCellsAssessed = dplyr::n(), nExpandedCells = sum(expanded),
+                   propExpanded = mean(expanded), .groups = "drop") %>%
+  dplyr::mutate(project = factor(project, levels = donorLevels)) %>%
+  dplyr::arrange(project)
+
+s5dP <- suppressWarnings(wilcox.test(propExpanded ~ studyGroup, data = s5d)$p.value)
+
+pS5D <- ggplot(s5d, aes(studyGroup, propExpanded, colour = studyGroup)) +
+  stat_summary(fun = median, geom = "crossbar", width = 0.45, colour = "black",
+               fatten = 1, linewidth = 0.4) +
+  geom_jitter(width = 0.12, height = 0, size = 2.4, alpha = 0.9) +
+  scale_colour_manual(values = GROUP_COLORS, guide = "none") +
+  labs(x = NULL, y = "proportion of expanded cells",
+       title = "Supplemental Figure S5D: clonal expansion",
+       subtitle = sprintf("%s chain, threshold %.3f | Wilcoxon p = %s",
+                          CLONE_CHAINS, CLONE_DIST_THRESHOLD, signif(s5dP, 3))) +
+  theme_classic(base_size = 11)
+print(pS5D)
+
+kable(s5d, caption = "Source data, Supplemental Figure S5D (per donor)")
+```
+
+```{r fig_S5D_heavy_table}
+## Per-cell source data for the panel: the heavy chain of every assessed cell,
+## with its distance, both criteria, and the resulting call.
+s5dHeavy <- seqLevel %>%
+  dplyr::filter(chain == "heavy", libid %in% cellExp$libid) %>%
+  dplyr::left_join(cellExp %>% dplyr::select(libid, byDistance, byIdentical, expanded),
+                   by = "libid") %>%
+  dplyr::transmute(libid, donorId, project, studyGroup, isotype,
+                   v_gene = v_call, j_gene = j_call, c_gene = c_call,
+                   cdr3_aa, cdr3_nt = junction, cdr3_nt_length = nchar(junction),
+                   nearestNeighbourDistance = round(dist_nearest, 4),
+                   cellsSharingIdenticalVJCCDR3 = nCellsIdentical,
+                   metCriterionDistance = byDistance,
+                   metCriterionIdentical = byIdentical,
+                   expanded) %>%
+  dplyr::arrange(studyGroup, project, dplyr::desc(expanded), libid)
+
+stopifnot(nrow(s5dHeavy) == nrow(cellExp))
+saveSource(s5dHeavy, "SupplFig5D_heavy_chain_per_cell",
+           "one row per assessed cell: the heavy chain behind the panel")
+kable(head(s5dHeavy, 10),
+      caption = "Source data, Supplemental Figure S5D (per cell; first 10 rows)")
+```
+
+## Sensitivity to the analysis choices
+
+```{r clone_sensitivity}
+variants <- list(
+  list(label = "heavy chain, threshold 0.193 (reported)",  t = 0.193, ch = "heavy", ident = "heavy"),
+  list(label = "heavy distance + identity either chain",   t = 0.193, ch = "heavy", ident = "any"),
+  list(label = "any chain, threshold 0.193",               t = 0.193, ch = "any",   ident = "any"),
+  list(label = "heavy chain, threshold 0.045",             t = 0.045, ch = "heavy", ident = "heavy"),
+  list(label = "heavy chain, identical CDR3 only",         t = 0,     ch = "heavy", ident = "heavy"))
+
+sensitivity <- do.call(rbind, lapply(variants, function(v) {
+  e <- callExpansion(dist_threshold = v$t, chains = v$ch, identicalChains = v$ident)
+  props <- e$cells %>% dplyr::group_by(project, studyGroup) %>%
+    dplyr::summarise(prop = mean(expanded), .groups = "drop")
+  data.frame(variant = v$label, cellsAssessed = nrow(e$cells),
+             expandedCells = sum(e$cells$expanded),
+             pctExpanded = round(100 * mean(e$cells$expanded), 1),
+             medianTC = round(median(props$prop[props$studyGroup == "TC"]), 3),
+             medianDS = round(median(props$prop[props$studyGroup == "DS"]), 3),
+             wilcoxP = round(suppressWarnings(
+               tryCatch(wilcox.test(prop ~ studyGroup, data = props)$p.value,
+                        error = function(e) NA_real_)), 3))
+}))
+kable(sensitivity, caption = "Effect of the analysis choices on Supplemental Figure S5D")
+saveSource(sensitivity, "SupplFig5D_sensitivity", "sensitivity of the panel to analysis choices")
+```
+
+The conclusion --- no significant difference between groups --- holds under every
+variant. Two choices are worth stating explicitly in the legend:
+
+- **Chain.** Restricting to the heavy chain is what makes "expanded" mean
+  clonally related. Admitting light-chain matches raises apparent expansion
+  several-fold, but inspection of the cells it adds shows they carry unrelated
+  heavy chains and share only a public kappa rearrangement (IGKV4-1 or IGKV1-39
+  with a short stereotyped junction), so they are convergent, not clonal.
+- **Threshold.** 0.193 is the value in the methods. `findThreshold()` on these
+  data returns a similar value by the gmm method (the density method does not
+  converge here), so it is well supported; the gmm fit is stochastic and `SEED`
+  fixes it.
+
+```{r clone_carry_forward}
+## Carry the expansion calls onto the cell metadata for later steps.
+cells <- cells %>%
+  dplyr::left_join(cellExp %>% dplyr::select(libid, expanded), by = "libid") %>%
+  dplyr::mutate(expanded = tidyr::replace_na(expanded, FALSE))
+```
+
+# Repertoire metrics beyond expansion (reviewer comment 8)
+
+Diversity, evenness, dominant-group representation and further repertoire
+summary statistics, on the 650 heavy chains of the analysis cells.
+
+**Terminology.** These groups are called *expansion groups*, not clones. A group
+is a set of heavy chains that cluster together at the threshold used for
+Supplemental Figure S5D; at a length-normalized Hamming distance of 0.193 a
+typical CDR3 admits several mismatches, so membership indicates sequence
+similarity rather than a verified clonal lineage. Groups of two or more cells are
+what the panel counts as expanded.
+
+## Assigning expansion groups
+
+Expansion above was called per sequence from nearest-neighbour distances.
+Diversity metrics need group memberships, so sequences are clustered by
+**single linkage at the same threshold, within donor x V gene x J gene x
+junction-length groups** --- the same grouping `distToNearest` uses.
+
+```{r clone_clustering}
+heavyRep <- cloneDist %>%
+  dplyr::filter(chain == "heavy") %>%
+  dplyr::mutate(jlen = nchar(junction),
+                grp  = paste(project, v_call, j_call, jlen, sep = "|"))
+
+assignExpansionGroups <- function(d, threshold = CLONE_DIST_THRESHOLD) {
+  if (nrow(d) == 1) return(paste0(d$grp[1], "_1"))
+  m <- stringdist::stringdistmatrix(d$junction, d$junction, method = "hamming") / d$jlen[1]
+  paste0(d$grp[1], "_", cutree(hclust(as.dist(m), method = "single"), h = threshold))
+}
+
+heavyRep <- heavyRep %>%
+  dplyr::group_split(grp) %>%
+  lapply(function(d) { d$group_id <- assignExpansionGroups(d); d }) %>%
+  dplyr::bind_rows() %>%
+  dplyr::group_by(project, group_id) %>%
+  dplyr::mutate(groupSize = dplyr::n()) %>%
+  dplyr::ungroup()
+
+cat(sprintf("%d heavy chains -> %d expansion groups | largest group %d cells | %d cells in groups of >= 2\n",
+            nrow(heavyRep), dplyr::n_distinct(heavyRep$group_id),
+            max(heavyRep$groupSize), sum(heavyRep$groupSize >= 2)))
+## Audit trail: every multi-cell expansion group with its members.
+expandedGroups <- heavyRep %>%
+  dplyr::filter(groupSize >= 2) %>%
+  dplyr::group_by(project, studyGroup, group_id, groupSize) %>%
+  dplyr::summarise(v_gene = paste(unique(v_call), collapse = ";"),
+                   j_gene = paste(unique(j_call), collapse = ";"),
+                   isotypes = paste(sort(unique(c_call)), collapse = ";"),
+                   cdr3_aa = paste(unique(cdr3_aa), collapse = " / "),
+                   libids = paste(sort(libid), collapse = ", "), .groups = "drop") %>%
+  dplyr::arrange(dplyr::desc(groupSize), project)
+kable(expandedGroups %>% dplyr::select(-group_id), caption = "Every multi-cell expansion group")
+saveSource(expandedGroups, "Repertoire_expanded_groups", "one row per multi-cell expansion group")
+
+kable(heavyRep %>% dplyr::distinct(project, group_id, groupSize) %>%
+        dplyr::count(groupSize, name = "nGroups"),
+      caption = "Expansion group size distribution, both groups pooled")
+```
+
+Note this yields slightly more cells in expanded groups than the S5D panel
+(26 vs 24). The difference is deliberate: criterion (ii) of the published
+methods requires a matching **C gene**, whereas the clustering ignores it, since
+isotype switching within a lineage is expected biology.
+
+## Per-donor repertoire summary statistics
+
+```{r repertoire_metrics}
+hillNumber <- function(p, q) {
+  p <- p[p > 0]
+  if (q == 1) exp(-sum(p * log(p))) else sum(p^q)^(1 / (1 - q))
+}
+## Rarefied metrics: resample every donor to a common depth so that diversity is
+## not simply a readout of how many cells were sequenced.
+rarefy <- function(sizes, n, reps = RAREFY_REPS) {
+  pool <- rep(seq_along(sizes), sizes)
+  if (length(pool) < n) return(c(NA_real_, NA_real_))
+  rowMeans(replicate(reps, {
+    tab <- table(sample(pool, n)) / n
+    c(length(tab), hillNumber(as.numeric(tab), 1))
+  }))
+}
+rarefyDepth <- min(table(heavyRep$project))
+
+repMetrics <- heavyRep %>%
+  dplyr::group_split(project) %>%
+  lapply(function(d) {
+    sizes <- as.numeric(table(d$group_id)); prop <- sizes / sum(sizes)
+    rr    <- rarefy(sizes, rarefyDepth)
+    vProp <- as.numeric(table(d$v_call)); vProp <- vProp / sum(vProp)
+    tibble::tibble(
+      project = d$project[1], studyGroup = d$studyGroup[1],
+      nCells = nrow(d), nGroups = length(sizes), maxGroupSize = max(sizes),
+      pctCellsInExpandedGroups = 100 * sum(sizes[sizes >= 2]) / sum(sizes),
+      pctSingletonGroups = 100 * mean(sizes == 1),
+      shannon = -sum(prop * log(prop)),
+      hill1 = hillNumber(prop, 1), hill2 = hillNumber(prop, 2),
+      evenness = -sum(prop * log(prop)) / log(length(sizes)),
+      top1Share = 100 * max(sizes) / sum(sizes),
+      top5Share = 100 * sum(sort(sizes, decreasing = TRUE)[seq_len(min(5, length(sizes)))]) / sum(sizes),
+      rarefiedRichness = rr[1], rarefiedHill1 = rr[2],
+      vGeneRichness = dplyr::n_distinct(d$v_call),
+      vGeneShannon = -sum(vProp * log(vProp)),
+      medianCDR3nt = median(d$jlen))
+  }) %>%
+  dplyr::bind_rows() %>%
+  dplyr::mutate(project = factor(project, levels = donorLevels)) %>%
+  dplyr::arrange(project)
+
+cat(sprintf("rarefaction depth = %d cells (the smallest donor)\n", rarefyDepth))
+kable(repMetrics %>%
+        dplyr::select(project, studyGroup, nCells, nGroups, maxGroupSize,
+                      dplyr::all_of(REPORT_METRICS)) %>%
+        dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 3))),
+      caption = "Per-donor repertoire metrics (nCells / nGroups / maxGroupSize are context, not tested)")
+saveSource(repMetrics %>% dplyr::mutate(project = as.character(project)),
+           "Repertoire_metrics_per_donor", "one row per donor, all metrics computed")
+```
+
+```{r repertoire_stats}
+## Donor-level Wilcoxon on exactly the metrics the figure shows, BH-corrected
+## across the six. The corWithDepth column asks whether a metric is really just
+## reporting how many cells were sequenced.
+repStats <- do.call(rbind, lapply(REPORT_METRICS, function(m) {
+  x <- repMetrics[[m]][repMetrics$studyGroup == "TC"]
+  y <- repMetrics[[m]][repMetrics$studyGroup == "DS"]
+  tibble::tibble(metric = m, medianTC = median(x, na.rm = TRUE),
+                 medianDS = median(y, na.rm = TRUE),
+                 p = suppressWarnings(wilcox.test(x, y)$p.value),
+                 corWithDepth = if (m == "nCells") NA_real_ else
+                   cor(repMetrics$nCells, repMetrics[[m]], use = "complete.obs"))
+})) %>%
+  dplyr::mutate(padj = p.adjust(p, method = "BH")) %>%
+  dplyr::arrange(p)
+
+kable(repStats %>% dplyr::mutate(dplyr::across(where(is.numeric), ~ signif(.x, 3))),
+      caption = "DS vs Ctrl for the reported metrics (Wilcoxon, BH-corrected across the six), with each metric's correlation with cells sequenced")
+saveSource(repStats, "Repertoire_statistics", "one row per reported metric")
+```
+
+## Expansion group size distribution
+
+```{r fig_group_sizes, fig.width=5, fig.height=3.6}
+groupSizes <- heavyRep %>%
+  dplyr::distinct(studyGroup, project, group_id, groupSize) %>%
+  dplyr::count(studyGroup, groupSize, name = "nGroups")
+
+pSizes <- ggplot(groupSizes, aes(factor(groupSize), nGroups, fill = studyGroup)) +
+  geom_col(position = position_dodge(preserve = "single")) +
+  geom_text(aes(label = nGroups), position = position_dodge(width = 0.9),
+            vjust = -0.3, size = 3) +
+  scale_fill_manual(values = GROUP_COLORS) +
+  labs(x = "expansion group size (cells)", y = "number of groups", fill = NULL,
+       title = "Expansion group size distribution",
+       subtitle = "both repertoires are almost entirely single-cell groups") +
+  theme_classic(base_size = 11)
+print(pSizes)
+savePanel(pSizes, "Repertoire_group_size_distribution", width = 5, height = 3.6)
+saveSource(groupSizes, "Repertoire_group_size_distribution", "groups per size per group")
+```
+
+## Rarefaction: is the repertoire sampled deeply enough to say anything?
+
+```{r fig_rarefaction, fig.width=5.6, fig.height=4}
+rarefactionCurve <- heavyRep %>%
+  dplyr::group_split(project) %>%
+  lapply(function(d) {
+    sizes <- as.numeric(table(d$group_id)); pool <- rep(seq_along(sizes), sizes)
+    depths <- unique(pmax(1, round(seq(1, length(pool), length.out = 20))))
+    tibble::tibble(project = d$project[1], studyGroup = d$studyGroup[1], depth = depths,
+                   groups = vapply(depths, function(n)
+                     mean(replicate(50, length(unique(sample(pool, n))))), numeric(1)))
+  }) %>% dplyr::bind_rows()
+
+pRare <- ggplot(rarefactionCurve, aes(depth, groups, group = project, colour = studyGroup)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted") +
+  geom_line(alpha = 0.8) +
+  scale_colour_manual(values = GROUP_COLORS) +
+  labs(x = "heavy chains sampled", y = "distinct expansion groups observed", colour = NULL,
+       title = "Rarefaction by donor",
+       subtitle = "dotted line = one group per cell; curves sit on it, so sampling is the limit") +
+  theme_classic(base_size = 11)
+print(pRare)
+savePanel(pRare, "Repertoire_rarefaction", width = 5.6, height = 4)
+saveSource(rarefactionCurve, "Repertoire_rarefaction", "mean groups observed per sampling depth per donor")
+```
+
+## Hill diversity spectrum
+
+```{r fig_hill, fig.width=5.6, fig.height=4}
+## alakazam downsamples both groups to a common depth and bootstraps CIs.
+divCurve <- alakazam::alphaDiversity(as.data.frame(heavyRep), group = "studyGroup",
+                                    clone = "group_id", min_q = 0, max_q = 4,
+                                    step_q = 0.25, nboot = DIVERSITY_NBOOT)
+divDf <- divCurve@diversity
+
+pHill <- ggplot(divDf, aes(q, d, colour = studyGroup, fill = studyGroup)) +
+  geom_ribbon(aes(ymin = d_lower, ymax = d_upper), alpha = 0.2, colour = NA) +
+  geom_line(linewidth = 0.8) +
+  scale_colour_manual(values = GROUP_COLORS) +
+  scale_fill_manual(values = GROUP_COLORS) +
+  labs(x = "diversity order q", y = expression(""^q * D), colour = NULL, fill = NULL,
+       title = "Hill diversity spectrum",
+       subtitle = "q=0 richness, q=1 Shannon, q=2 Simpson; shaded = bootstrap 95% CI") +
+  theme_classic(base_size = 11)
+print(pHill)
+savePanel(pHill, "Repertoire_hill_diversity", width = 5.6, height = 4)
+saveSource(divDf, "Repertoire_hill_diversity", "Hill diversity with bootstrap CI by group")
+```
+
+## Donor-level comparison of the interpretable metrics
+
+```{r fig_metric_panels, fig.width=8, fig.height=5}
+metricLong <- repMetrics %>%
+  dplyr::select(project, studyGroup, dplyr::all_of(REPORT_METRICS)) %>%
+  tidyr::pivot_longer(-c(project, studyGroup), names_to = "metric") %>%
+  dplyr::mutate(metric = factor(metric, levels = REPORT_METRICS))
+metricLabs <- repStats %>%
+  dplyr::mutate(label = sprintf("p = %.2f", p),
+                metric = factor(metric, levels = REPORT_METRICS))
+
+pMetrics <- ggplot(metricLong, aes(studyGroup, value, colour = studyGroup)) +
+  stat_summary(fun = median, geom = "crossbar", width = 0.5, colour = "black",
+               fatten = 1, linewidth = 0.3) +
+  geom_jitter(width = 0.12, height = 0, size = 1.8, alpha = 0.85) +
+  geom_text(data = metricLabs, aes(x = 1.5, y = Inf, label = label),
+            inherit.aes = FALSE, vjust = 1.4, size = 3) +
+  facet_wrap(~ metric, scales = "free_y", nrow = 2) +
+  scale_colour_manual(values = GROUP_COLORS, guide = "none") +
+  labs(x = NULL, y = NULL, title = "Repertoire metrics, DS vs Ctrl",
+       subtitle = "donor-level Wilcoxon; none significant") +
+  theme_bw(base_size = 10)
+print(pMetrics)
+```
+
+## Summary numbers
+
+```{r repertoire_interpretation}
+cat(sprintf("smallest / median / largest donor: %d / %.0f / %d heavy chains\n",
+            min(repMetrics$nCells), median(repMetrics$nCells), max(repMetrics$nCells)))
+cat(sprintf("single-cell groups: %.1f%% of all groups | largest group in the study: %d cells\n",
+            100 * mean(heavyRep$groupSize == 1), max(heavyRep$groupSize)))
+cat(sprintf("rarefied richness at %d cells: Ctrl %.1f, DS %.1f (ceiling = %d)\n",
+            rarefyDepth, median(repMetrics$rarefiedRichness[repMetrics$studyGroup == "TC"]),
+            median(repMetrics$rarefiedRichness[repMetrics$studyGroup == "DS"]), rarefyDepth))
+cat(sprintf("metrics with BH-adjusted p < 0.05: %d of %d\n",
+            sum(repStats$padj < 0.05), nrow(repStats)))
+```
+
+# Save for step 3
+
+Raw counts for the 801 retained cells, plus the chain, isotype and
+expansion-group metadata assembled here.
+
+```{r save}
+countsStep2 <- rawCounts[, cells$libid]
+stopifnot(all(countsStep2 %% 1 == 0), identical(colnames(countsStep2), cells$libid))
+
+saveRDS(list(counts = countsStep2, cellAnno = cells, geneAnno = geneAnno,
+             ## All QC-passing libraries with their chain counts and doublet
+             ## flag, i.e. upstream of the doublet cut. Supplemental Figure 7B
+             ## and 7C are drawn on this set, so it is saved alongside the
+             ## post-doublet cellAnno rather than recomputed by the panel scripts.
+             libAnno = libAnno,
+             cloneSeqLevel = seqLevel, heavyRepertoire = heavyRep,
+             repertoireMetrics = repMetrics,
+             params = list(MIN_HEAVY_DOUBLET = MIN_HEAVY_DOUBLET,
+                           MIN_LIGHT_DOUBLET = MIN_LIGHT_DOUBLET,
+                           CLONE_DIST_THRESHOLD = CLONE_DIST_THRESHOLD,
+                           CLONE_CHAINS = CLONE_CHAINS,
+                           CLONE_IDENTICAL_CHAINS = CLONE_IDENTICAL_CHAINS,
+                           CLONE_DENOMINATOR = CLONE_DENOMINATOR,
+                           CLONE_MIN_SIZE = CLONE_MIN_SIZE,
+                           S5_LIBRARY_SET = S5_LIBRARY_SET, SEED = SEED),
+             sessionInfo = sessionInfo()),
+        file.path(OUT_DIR, "step2_cells_chains.rds"))
+write_csv(cells, file.path(OUT_DIR, "step2_cell_metadata.csv"))
+
+cat(sprintf("saved %d genes x %d cells (raw counts) to %s\n",
+            nrow(countsStep2), ncol(countsStep2),
+            file.path(OUT_DIR, "step2_cells_chains.rds")))
+
+## Cells available per donor x isotype -- this sets pseudobulk power in step 3.
+cells %>%
+  dplyr::filter(isotype %in% c("IGHG", "IGHM")) %>%
+  dplyr::count(studyGroup, project, isotype) %>%
+  tidyr::pivot_wider(names_from = isotype, values_from = n, values_fill = 0) %>%
+  dplyr::arrange(studyGroup, project) %>%
+  kable(caption = "Cells per donor for the IgG / IgM pseudobulk comparison")
+```
+
+# Where this goes next
+
+**Step 3** adds draw-to-processing time, normalizes for visualization, and looks
+at cell-level structure (PCA / UMAP). **Step 4** pseudobulks by donor x isotype
+and runs the differential expression with
+`~ studyGroup + TimeElapsed_binary`.
+
+Isotype is assigned from the heavy chain throughout, so the IgG and IgM subsets
+carried into step 4 are the ones in the table above.

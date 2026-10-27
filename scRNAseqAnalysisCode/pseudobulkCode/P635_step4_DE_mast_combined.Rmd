@@ -1,0 +1,852 @@
+---
+title: "P635 --- Step 4 (MAST, combined isotypes): is there evidence of a group-by-isotype interaction?"
+author: "Hannah DeBerg"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5)
+```
+
+# Purpose
+
+Every step-4 document so far has fitted IgG and IgM **separately** --- four
+methods, eight independent models, no term connecting them. That design cannot
+answer one question people keep asking of it: *does the DS effect differ between
+the two isotypes?* The concordance scatterplots put two separately-fitted
+coefficient sets on the same axes, which is descriptive. It is not a test.
+
+This document fits a **single model over both isotypes at once** and asks the
+question directly. Two models, same cells, same genes, same random effect:
+
+$$\textbf{additive:}\quad \sim t + g + s + c + (1\,|\,\text{donor})$$
+$$\textbf{interaction:}\quad \sim t + g \times s + c + (1\,|\,\text{donor})$$
+
+with $t$ processing time, $g$ study group, $s$ isotype, $c$ the cellular
+detection rate. The interaction coefficient is tested by likelihood-ratio test,
+which **is** the comparison between the two models --- a gene with no interaction
+is a gene for which the additive model is sufficient.
+
+**Reading the coefficients.** `isotype` is coded with IgG as the reference, so in
+the interaction model `studyGroupDS` is *the DS effect within IgG*, not a main
+effect averaged over both. The DS effect within IgM is
+`studyGroupDS + studyGroupDS:isotypeIGHM`. All three are reported below. In the
+additive model `studyGroupDS` is a single DS effect constrained to be the same in
+both isotypes.
+
+**What counts as evidence.** Three things, in order of how much weight they
+carry:
+
+1. the number of genes whose interaction clears FDR, against what the permutation
+   null produces;
+2. the shape of the interaction p-value histogram --- flat means no interaction
+   anywhere, a spike near zero means some genes genuinely differ;
+3. whether the additive model's DS effect agrees with the two per-isotype effects
+   estimated separately in `P635_step4_DE_mast.Rmd`.
+
+Given that every per-isotype analysis returned no differentially expressed genes,
+the prior here is firmly that there is nothing to find. The point of the exercise
+is to be able to say so from a model that was actually capable of finding it.
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(readr)
+library(ggplot2)
+library(ggrepel)
+library(knitr)
+library(MAST)
+library(SingleCellExperiment)
+library(SummarizedExperiment)
+library(lme4)
+library(patchwork)
+library(limma)
+library(msigdbr)
+```
+
+# Parameters
+
+```{r params}
+STEP3_RDS <- file.path("pseudobulk_clean_output", "step3_cells_time_structure.rds")
+OUT_DIR   <- "pseudobulk_clean_output"
+FIG_DIR   <- file.path(OUT_DIR, "figures", "mast_combined")
+SRC_DIR   <- file.path(OUT_DIR, "figure_source_data", "mast_combined")
+CACHE_DIR <- file.path(OUT_DIR, "cache", "mast_combined")
+
+DE_ISOTYPES <- c("IGHG", "IGHM")
+
+## Donor inclusion matches the per-isotype documents: a donor contributes its
+## cells of an isotype only if it has at least MIN_CELLS of them. A donor can
+## therefore contribute IgG cells but not IgM. The gene filter, by contrast, is
+## recomputed on the pooled matrix, since that is the matrix being modelled.
+MIN_CELLS   <- 5
+CELL_DETECT <- 0.10
+
+FORMULA_ADD <- ~ TimeElapsed_binary + studyGroup + isotype + cngeneson + (1 | donorId)
+FORMULA_INT <- ~ TimeElapsed_binary + studyGroup * isotype + cngeneson + (1 | donorId)
+COEF_GROUP  <- "studyGroupDS"                 # DS effect (in IgG, under FORMULA_INT)
+COEF_INT    <- "studyGroupDS:isotypeIGHM"     # how that effect shifts in IgM
+
+FDR     <- 0.10
+LFC_MIN <- 1
+N_LABELS <- 12
+
+## Permutation null for the interaction test. Group labels are shuffled between
+## donors and every cell carries its donor's new label, so donor structure,
+## isotype assignment and cells-per-donor are all untouched -- only the
+## DS/control contrast is randomised. Under that null there is no group effect
+## and therefore no interaction either, so the number of genes the interaction
+## test calls is a direct read on its calibration.
+RUN_PERM <- TRUE
+## Split deliberately. The interaction permutation confirms a null that three
+## independent lines already establish (0 genes, flat p-value histogram, flat
+## interaction GSEA), so it is kept cheap. The group permutation is the one that
+## decides whether the called genes are real, and gets the full count: with 50
+## the empirical p can reach 1/51 = 0.02, against 1/11 = 0.09 at ten.
+N_PERM_INT   <- 10
+N_PERM_GROUP <- 50
+
+GSEA_COLLECTION <- "H"
+GSEA_MIN_SIZE   <- 10
+GSEA_MAX_SIZE   <- 500
+## 0.10, matching the gene-level FDR used throughout this project. The dashed
+## line on the hallmark figure and the bar colouring both read from this, so they
+## cannot drift apart. Note the consequence: at 0.10 one set (KRAS_SIGNALING_DN,
+## FDR 0.093) is called, where at 0.05 nothing was.
+GSEA_FDR        <- 0.10
+GSEA_N_SHOW     <- 10
+
+SEED    <- 42
+N_CORES <- max(1L, min(8L, parallel::detectCores() - 2L))
+options(mc.cores = N_CORES)
+USE_CACHE <- TRUE
+
+for (d in c(OUT_DIR, FIG_DIR, SRC_DIR, CACHE_DIR))
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+
+cached <- function(name, key, expr) {
+  path <- file.path(CACHE_DIR, sprintf("%s.rds", name))
+  if (USE_CACHE && file.exists(path)) {
+    obj <- readRDS(path)
+    if (identical(obj$key, key)) { cat(sprintf("cache hit: %s\n", basename(path))); return(obj$value) }
+  }
+  t0 <- Sys.time(); value <- expr
+  saveRDS(list(key = key, value = value), path)
+  cat(sprintf("computed %s in %.1f min\n", basename(path),
+              as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+  value
+}
+saveSource <- function(dat, name, description) {
+  path <- file.path(SRC_DIR, sprintf("%s.csv", name))
+  write_csv(dat, path)
+  cat(sprintf("source data: %-46s %5d rows  (%s)\n", basename(path), nrow(dat), description))
+  invisible(path)
+}
+savePanel <- function(plot, name, width = 6.5, height = 4.5) {
+  ggsave(file.path(FIG_DIR, sprintf("%s.pdf", name)), plot, width = width, height = height)
+  ggsave(file.path(FIG_DIR, sprintf("%s.png", name)), plot, width = width, height = height,
+         dpi = 300, bg = "white")
+  invisible(plot)
+}
+```
+
+# Load step 3 and pool the isotypes
+
+```{r load_step3}
+step3     <- readRDS(STEP3_RDS)
+rawCounts <- step3$counts
+cells     <- step3$cellAnno
+geneAnno  <- step3$geneAnno
+stopifnot(all(rawCounts %% 1 == 0))
+
+IG_PATTERN <- "^IG[HKL](V|D|J|C)[0-9]|^IGH[ADEGM][0-9]?$|^IGKC$|^IGLC[0-9]$"
+symbolOf   <- geneAnno$symbol[match(rownames(rawCounts), geneAnno$ensgene)]
+keepGene   <- !is.na(symbolOf) & symbolOf != "" & !str_detect(symbolOf, IG_PATTERN)
+countsSym  <- rowsum(rawCounts[keepGene, ], group = symbolOf[keepGene])
+```
+
+```{r pool}
+## Per-isotype donor inclusion, then pool. Cells are ordered by donor so that the
+## random-effect grouping is contiguous, and by isotype within donor so the
+## design matrix is easy to inspect.
+keepByIso <- lapply(setNames(DE_ISOTYPES, DE_ISOTYPES), function(iso)
+  cells %>% dplyr::filter(isotype == iso) %>%
+    dplyr::count(donorId, name = "n") %>%
+    dplyr::filter(n >= MIN_CELLS) %>% dplyr::pull(donorId))
+
+pooled <- dplyr::bind_rows(lapply(DE_ISOTYPES, function(iso)
+  cells %>% dplyr::filter(isotype == iso, donorId %in% keepByIso[[iso]]))) %>%
+  dplyr::arrange(donorId, isotype) %>%
+  dplyr::mutate(studyGroup         = factor(studyGroup, levels = c("TC", "DS")),
+                isotype            = factor(isotype, levels = DE_ISOTYPES),
+                TimeElapsed_binary = factor(TimeElapsed_binary),
+                donorId            = factor(donorId))
+
+counts  <- countsSym[, pooled$libid]
+libsize <- colSums(counts)
+detect  <- rowMeans(counts > 0)
+counts  <- counts[detect >= CELL_DETECT, , drop = FALSE]
+
+cat(sprintf("pooled: %d cells, %d donors, %d genes tested\n",
+            nrow(pooled), dplyr::n_distinct(pooled$donorId), nrow(counts)))
+print(table(studyGroup = pooled$studyGroup, isotype = pooled$isotype))
+```
+
+## Which donors contribute which isotypes
+
+The interaction is informed by donors who contribute **both** isotypes; a donor
+with only one contributes to the main effects alone. That split is worth seeing
+before the models are fitted.
+
+```{r donor_table}
+donorTab <- pooled %>%
+  dplyr::count(donorId, project, studyGroup, TimeElapsed_binary, isotype, name = "nCells") %>%
+  tidyr::pivot_wider(names_from = isotype, values_from = nCells, values_fill = 0L) %>%
+  dplyr::mutate(bothIsotypes = IGHG > 0 & IGHM > 0) %>%
+  dplyr::arrange(studyGroup, project)
+kable(donorTab, caption = sprintf("Cells per donor per isotype (>= %d to contribute)", MIN_CELLS))
+saveSource(donorTab, "Step4_mastComb_donor_table", "one row per donor")
+
+cat(sprintf("\ndonors contributing both isotypes: %d of %d\n",
+            sum(donorTab$bothIsotypes), nrow(donorTab)))
+if (any(!donorTab$bothIsotypes))
+  cat(sprintf("single-isotype donors (main effects only): %s\n",
+              paste(donorTab$project[!donorTab$bothIsotypes], collapse = ", ")))
+
+## Full rank is not optional here: with group nested in donor and isotype crossed
+## with it, a thin cell can make the interaction inestimable.
+dm <- model.matrix(~ TimeElapsed_binary + studyGroup * isotype, data = pooled)
+cat(sprintf("\ndesign rank %d of %d columns\n", qr(dm)$rank, ncol(dm)))
+print(colnames(dm))
+stopifnot(qr(dm)$rank == ncol(dm))
+```
+
+# Fit both models
+
+```{r fit_functions}
+## MAST reports coefficients in the units of the assay it is handed. The assay
+## here is log2(CPM+1), so the coefficients are already log2 -- verified in
+## P635_step4_DE_mast.Rmd by fitting the same genes on log2 and natural-log
+## assays and recovering a ratio of exactly log(2). No conversion is applied.
+makeSCA <- function(cellsDf, cnt, lib, genes = NULL) {
+  if (!is.null(genes)) cnt <- cnt[genes, , drop = FALSE]
+  stopifnot(identical(as.character(cellsDf$libid), colnames(cnt)))
+  ex   <- log2(t(t(cnt) / lib) * 1e6 + 1)
+  cdat <- data.frame(wellKey = colnames(ex), cellsDf, row.names = colnames(ex))
+  fdat <- data.frame(primerid = rownames(ex), row.names = rownames(ex))
+  sca  <- MAST::FromMatrix(ex, cData = cdat, fData = fdat, check_sanity = FALSE)
+  cdr  <- colSums(SummarizedExperiment::assay(sca) > 0)
+  SummarizedExperiment::colData(sca)$cngeneson <- scale(cdr)[, 1]
+  sca
+}
+
+## Returns one row per gene per requested coefficient: the hurdle LRT p-value and
+## the continuous-component log2 fold change.
+runMast <- function(form, coefs, cellsDf = pooled, cnt = counts, lib = libsize) {
+  sca <- makeSCA(cellsDf, cnt, lib)
+  zz  <- suppressMessages(MAST::zlm(form, sca, method = "glmer", ebayes = FALSE,
+                                    strictConvergence = FALSE, parallel = TRUE, silent = TRUE))
+  ss  <- suppressMessages(MAST::summary(zz, doLRT = coefs, parallel = TRUE))
+  sdt <- as.data.frame(ss$datatable)
+  conv <- as.data.frame(zz@converged) %>% tibble::rownames_to_column("gene") %>%
+    dplyr::rename(convergedC = C, convergedD = D)
+
+  dplyr::bind_rows(lapply(coefs, function(cf) {
+    hurdle <- sdt %>% dplyr::filter(contrast == cf, component == "H") %>%
+      dplyr::select(gene = primerid, p = `Pr(>Chisq)`)
+    lfc <- sdt %>% dplyr::filter(contrast == cf, component == "logFC") %>%
+      dplyr::select(gene = primerid, log2FC = coef, ci.lo, ci.hi)
+    dplyr::full_join(hurdle, lfc, by = "gene") %>% dplyr::mutate(coefficient = cf)
+  })) %>%
+    dplyr::left_join(conv, by = "gene") %>%
+    dplyr::mutate(converged = convergedC & convergedD)
+}
+
+## BH over genes, within a coefficient, restricted to genes that actually fitted.
+addFDR <- function(df) df %>% dplyr::group_by(coefficient) %>%
+  dplyr::mutate(padj = ifelse(converged & !is.na(p), p, NA_real_),
+                padj = p.adjust(padj, method = "BH")) %>%
+  dplyr::ungroup()
+```
+
+```{r fit}
+fitKey <- list(MIN_CELLS = MIN_CELLS, CELL_DETECT = CELL_DETECT, SEED = SEED,
+               nCells = nrow(pooled), nGenes = nrow(counts),
+               add = deparse(FORMULA_ADD), int = deparse(FORMULA_INT))
+
+resAdd <- cached("step4_mastComb_additive", fitKey,
+                 runMast(FORMULA_ADD, c(COEF_GROUP, "isotypeIGHM"))) %>% addFDR()
+resInt <- cached("step4_mastComb_interaction", fitKey,
+                 runMast(FORMULA_INT, c(COEF_GROUP, COEF_INT))) %>% addFDR()
+
+chrOf <- geneAnno %>% dplyr::distinct(symbol, chr) %>%
+  dplyr::group_by(symbol) %>% dplyr::slice(1) %>% dplyr::ungroup()
+annot <- function(d) d %>% dplyr::left_join(chrOf, by = c("gene" = "symbol")) %>%
+  dplyr::mutate(significant = !is.na(padj) & padj < FDR & abs(log2FC) > LFC_MIN,
+                chr21 = !is.na(chr) & chr == "21")
+resAdd <- annot(resAdd); resInt <- annot(resInt)
+
+saveSource(resAdd, "Step4_mastComb_additive", "one row per gene x coefficient, additive model")
+saveSource(resInt, "Step4_mastComb_interaction", "one row per gene x coefficient, interaction model")
+```
+
+```{r fit_summary}
+fitSummary <- dplyr::bind_rows(
+  resAdd %>% dplyr::mutate(model = "additive"),
+  resInt %>% dplyr::mutate(model = "interaction")) %>%
+  dplyr::group_by(model, coefficient) %>%
+  dplyr::summarise(nGenes = dplyr::n(), nConverged = sum(converged),
+                   nTested = sum(!is.na(padj)),
+                   nSig = sum(significant),
+                   minPadj = signif(min(padj, na.rm = TRUE), 3),
+                   medAbsLfc = round(median(abs(log2FC), na.rm = TRUE), 2),
+                   .groups = "drop")
+kable(fitSummary, caption = sprintf("Both models (FDR < %.2f and |log2FC| > %g)", FDR, LFC_MIN))
+saveSource(fitSummary, "Step4_mastComb_summary", "one row per model x coefficient")
+```
+
+# Is there evidence of an interaction?
+
+```{r interaction_evidence}
+intOnly <- resInt %>% dplyr::filter(coefficient == COEF_INT, !is.na(padj))
+
+evid <- tibble::tibble(
+  nTested         = nrow(intOnly),
+  nSig_FDR        = sum(intOnly$padj < FDR),
+  nSig_FDR_and_LFC = sum(intOnly$significant),
+  minPadj         = signif(min(intOnly$padj), 3),
+  nP_under_05     = sum(intOnly$p < 0.05),
+  expectedP_under_05 = round(0.05 * nrow(intOnly)),
+  ratio_obs_exp   = round(sum(intOnly$p < 0.05) / (0.05 * nrow(intOnly)), 2))
+kable(evid, caption = "Interaction term: observed against the uniform expectation")
+saveSource(evid, "Step4_mastComb_interaction_evidence", "one row")
+```
+
+The `ratio_obs_exp` column is the quickest read available. Under a true null the
+interaction p-values are uniform, so 5% of genes fall below 0.05 by construction
+and the ratio is 1. A ratio near 1 with no gene clearing FDR means the additive
+model is sufficient for every gene --- the DS effect, such as it is, does not
+differ detectably between isotypes.
+
+```{r interaction_hist, fig.width=7, fig.height=3.6}
+pHist <- resInt %>% dplyr::filter(!is.na(padj)) %>%
+  dplyr::mutate(coefficient = factor(coefficient, levels = c(COEF_GROUP, COEF_INT),
+                                     labels = c("DS effect (within IgG)",
+                                                "interaction: DS effect shift in IgM"))) %>%
+  ggplot(aes(p)) +
+  geom_histogram(binwidth = 0.025, boundary = 0, fill = "grey65", colour = "white") +
+  geom_hline(yintercept = nrow(intOnly) * 0.025, linetype = "dashed", colour = "firebrick") +
+  facet_wrap(~ coefficient) +
+  labs(x = "hurdle p-value", y = "genes",
+       title = "p-value distribution, combined-isotype model",
+       subtitle = "dashed line: the flat height expected when nothing is going on") +
+  theme_classic(base_size = 11)
+print(pHist)
+savePanel(pHist, "Step4_mastComb_pvalue_histogram", width = 7, height = 3.6)
+```
+
+```{r interaction_volcano, fig.width=6.5, fig.height=5}
+d <- intOnly %>% dplyr::mutate(
+  direction = dplyr::case_when(!significant ~ "not significant",
+                               log2FC > 0 ~ "DS effect larger in IgM",
+                               TRUE ~ "DS effect larger in IgG"))
+labelled <- d %>% dplyr::slice_min(p, n = N_LABELS, with_ties = FALSE)
+pVolc <- ggplot(d, aes(log2FC, -log10(padj), colour = direction)) +
+  geom_hline(yintercept = -log10(FDR), linetype = "dashed", colour = "grey60") +
+  geom_vline(xintercept = c(-LFC_MIN, LFC_MIN), linetype = "dashed", colour = "grey60") +
+  geom_point(size = 1.1, alpha = 0.7) +
+  geom_text_repel(data = labelled, aes(label = gene), size = 2.8, colour = "black",
+                  max.overlaps = Inf, box.padding = 0.3, segment.size = 0.2,
+                  show.legend = FALSE) +
+  scale_colour_manual(values = c("DS effect larger in IgM" = "firebrick",
+                                 "DS effect larger in IgG" = "steelblue",
+                                 "not significant" = "grey75")) +
+  labs(x = expression("interaction coefficient (" * log[2] * " scale)"),
+       y = expression(-log[10] * "(BH-adjusted p)"), colour = NULL,
+       title = "Group-by-isotype interaction",
+       subtitle = sprintf("%d cells, %d donors, %d genes | %d at FDR < %.2f and |log2FC| > %g",
+                          nrow(pooled), dplyr::n_distinct(pooled$donorId),
+                          nrow(d), sum(d$significant), FDR, LFC_MIN)) +
+  theme_classic(base_size = 11) + theme(legend.position = "top")
+print(pVolc)
+savePanel(pVolc, "Step4_mastComb_interaction_volcano", width = 6.5, height = 5)
+```
+
+## Permutation null for the interaction test
+
+```{r permutation}
+permNull <- NULL
+if (RUN_PERM) {
+  permNull <- cached("step4_mastComb_permutation", list(fitKey, N_PERM = N_PERM_INT), {
+    donors <- pooled %>% dplyr::distinct(donorId, studyGroup, TimeElapsed_binary)
+    vapply(seq_len(N_PERM_INT), function(k) {
+      set.seed(SEED + 7919L * k)
+      repeat {
+        sh <- donors %>% dplyr::mutate(
+          studyGroup = factor(sample(as.character(studyGroup)), levels = c("TC", "DS")))
+        pp <- pooled %>% dplyr::select(-studyGroup) %>%
+          dplyr::left_join(sh %>% dplyr::select(donorId, studyGroup), by = "donorId")
+        dmp <- model.matrix(~ TimeElapsed_binary + studyGroup * isotype, data = pp)
+        if (qr(dmp)$rank == ncol(dmp)) break
+      }
+      r <- runMast(FORMULA_INT, COEF_INT, cellsDf = pp) %>% addFDR() %>% annot()
+      sum(r$significant)
+    }, numeric(1))
+  })
+
+  permSummary <- tibble::tibble(
+    nPermutations = length(permNull),
+    observed      = sum(intOnly$significant),
+    nullMedian    = median(permNull), nullMax = max(permNull),
+    empiricalP    = (1 + sum(permNull >= sum(intOnly$significant))) / (length(permNull) + 1))
+  kable(permSummary, caption = "Interaction genes called under permuted group labels")
+  saveSource(tibble::tibble(permutation = seq_along(permNull), nSig = permNull),
+             "Step4_mastComb_permutation_null", "one row per permutation")
+  saveSource(permSummary, "Step4_mastComb_permutation_summary", "one row")
+}
+```
+
+## Permutation null for the group effect
+
+The interaction null above says nothing about the DS coefficient, and that
+coefficient is the one that calls genes. Every earlier document in this project
+found that a gene list which looked convincing on its own sat inside its own
+permutation null, so the same test is applied here before anything is believed.
+The procedure is identical --- shuffle group labels between donors, every cell
+carries its donor's new label --- and the statistic is the number of genes the
+**additive** model calls.
+
+```{r permutation_group}
+permGroup <- NULL
+if (RUN_PERM) {
+  permGroup <- cached("step4_mastComb_permutation_group", list(fitKey, N_PERM = N_PERM_GROUP), {
+    donors <- pooled %>% dplyr::distinct(donorId, studyGroup, TimeElapsed_binary)
+    vapply(seq_len(N_PERM_GROUP), function(k) {
+      set.seed(SEED + 104729L * k)
+      repeat {
+        sh <- donors %>% dplyr::mutate(
+          studyGroup = factor(sample(as.character(studyGroup)), levels = c("TC", "DS")))
+        pp <- pooled %>% dplyr::select(-studyGroup) %>%
+          dplyr::left_join(sh %>% dplyr::select(donorId, studyGroup), by = "donorId")
+        dmp <- model.matrix(~ TimeElapsed_binary + studyGroup + isotype, data = pp)
+        if (qr(dmp)$rank == ncol(dmp)) break
+      }
+      r <- runMast(FORMULA_ADD, COEF_GROUP, cellsDf = pp) %>% addFDR() %>% annot()
+      sum(r$significant)
+    }, numeric(1))
+  })
+
+  obsGroup <- sum(resAdd$significant[resAdd$coefficient == COEF_GROUP])
+  permGroupSummary <- tibble::tibble(
+    nPermutations = length(permGroup), observed = obsGroup,
+    nullMedian = median(permGroup), nullQ90 = quantile(permGroup, 0.9),
+    nullMax = max(permGroup),
+    empiricalP = (1 + sum(permGroup >= obsGroup)) / (length(permGroup) + 1))
+  kable(permGroupSummary,
+        caption = "Additive model: genes called under permuted group labels")
+  saveSource(tibble::tibble(permutation = seq_along(permGroup), nSig = permGroup),
+             "Step4_mastComb_permutation_group_null", "one row per permutation")
+  saveSource(permGroupSummary, "Step4_mastComb_permutation_group_summary", "one row")
+}
+```
+
+```{r permutation_group_plot, fig.width=6.5, fig.height=3.4, eval=RUN_PERM}
+pPermG <- ggplot(tibble::tibble(nSig = permGroup), aes(nSig)) +
+  geom_histogram(binwidth = 1, boundary = -0.5, fill = "grey70", colour = "white") +
+  geom_point(aes(y = -0.4), shape = 124, size = 2.6, colour = "grey30") +
+  geom_vline(xintercept = permGroupSummary$observed, colour = "firebrick", linewidth = 0.9) +
+  scale_y_continuous(breaks = function(l) seq(0, ceiling(l[2]), by = 1)) +
+  labs(x = sprintf("genes called at FDR < %.2f and |log2FC| > %g", FDR, LFC_MIN),
+       y = "permutations",
+       title = "Additive model: permuted group labels versus the observed result",
+       subtitle = sprintf("%d permutations; red line = observed (%d). Null median %g, max %g, empirical p = %.3f",
+                          length(permGroup), permGroupSummary$observed,
+                          permGroupSummary$nullMedian, permGroupSummary$nullMax,
+                          permGroupSummary$empiricalP)) +
+  theme_classic(base_size = 11) + theme(plot.subtitle = element_text(size = 8))
+print(pPermG)
+savePanel(pPermG, "Step4_mastComb_permutation_group", width = 6.5, height = 3.4)
+```
+
+# Does the combined model agree with the separate ones?
+
+If the additive model is a fair summary, its single DS coefficient should sit
+between the two per-isotype coefficients estimated independently, and should
+correlate with both.
+
+```{r compare_separate}
+sepFiles <- file.path(OUT_DIR, "figure_source_data", "mast",
+                      sprintf("Step4_mast_DE_%s.csv", DE_ISOTYPES))
+if (all(file.exists(sepFiles))) {
+  sep <- dplyr::bind_rows(lapply(seq_along(DE_ISOTYPES), function(i)
+    readr::read_csv(sepFiles[i], show_col_types = FALSE) %>%
+      dplyr::transmute(gene, isotype = DE_ISOTYPES[i], lfc_sep = log2FC, p_sep = p)))
+  addG <- resAdd %>% dplyr::filter(coefficient == COEF_GROUP) %>%
+    dplyr::select(gene, lfc_add = log2FC)
+
+  cmp <- sep %>% dplyr::inner_join(addG, by = "gene") %>% dplyr::filter(!is.na(lfc_sep), !is.na(lfc_add))
+  cmpStats <- cmp %>% dplyr::group_by(isotype) %>%
+    dplyr::summarise(nGenes = dplyr::n(),
+                     pearson = round(cor(lfc_sep, lfc_add), 3),
+                     spearman = round(cor(lfc_sep, lfc_add, method = "spearman"), 3),
+                     .groups = "drop")
+  kable(cmpStats, caption = "Additive combined DS effect versus the separately-fitted per-isotype effects")
+  saveSource(cmpStats, "Step4_mastComb_vs_separate", "one row per isotype")
+
+  pCmp <- ggplot(cmp, aes(lfc_sep, lfc_add)) +
+    geom_hline(yintercept = 0, colour = "grey88") + geom_vline(xintercept = 0, colour = "grey88") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dotted", colour = "grey60") +
+    geom_point(size = 0.7, alpha = 0.35, colour = "#3E5C8A") +
+    facet_wrap(~ isotype, labeller = labeller(isotype = c(IGHG = "IgG", IGHM = "IgM"))) +
+    labs(x = expression("separate per-isotype model: " * log[2] * " fold change"),
+         y = expression("combined additive model: " * log[2] * " fold change"),
+         title = "One pooled DS effect against two separately-fitted ones") +
+    theme_bw(base_size = 11) + theme(panel.grid.minor = element_blank())
+  print(pCmp)
+  savePanel(pCmp, "Step4_mastComb_vs_separate", width = 7, height = 4)
+} else {
+  cat("per-isotype MAST results not found; skipping the comparison\n")
+}
+```
+
+# The additive DS effect
+
+The additive model estimates **one** DS effect per gene, shared across isotypes
+by construction, so there is nothing to plot it against: the natural pair is a
+volcano and a heatmap of what it called.
+
+Chromosome 21 is carried by **shape**, not colour. Five of the seven called genes
+are themselves chr21, so a second colour layer for chr21 would simply be painted
+over by the "called" layer and the overlap would be invisible.
+
+```{r additive_volcano, fig.width=7, fig.height=5.6}
+addDS <- resAdd %>% dplyr::filter(coefficient == COEF_GROUP, !is.na(padj), !is.na(log2FC))
+## A couple of genes return a hurdle p but no continuous estimate; they cannot be
+## placed on a fold-change axis, so they are dropped explicitly rather than being
+## discarded by ggplot with a warning.
+nDropped <- sum(resAdd$coefficient == COEF_GROUP & !is.na(resAdd$padj) & is.na(resAdd$log2FC))
+saveSource(addDS, "Step4_mastComb_additive_DS_effect", "one row per gene, additive DS effect")
+cat(sprintf("%d genes on the volcano; %d called (%d chr21); %d dropped for want of a continuous estimate\n",
+            nrow(addDS), sum(addDS$significant), sum(addDS$significant & addDS$chr21), nDropped))
+cat("  (these counts were previously the figure subtitle; the panel is now bare for the manuscript)\n")
+
+calledLab <- sprintf("called (FDR < %.2f, |log2FC| > %g)", FDR, LFC_MIN)
+## One categorical variable drives both shape and fill, so the two scales merge
+## into a single four-key legend. Mapping chr21 to shape and significance to
+## fill separately produced two legends that the reader had to combine mentally.
+## "chr21" rather than "chromosome 21", matching the heatmap row labels. Short
+## enough now that the two-line wrapping is no longer needed.
+LV <- c("DE, chr21", "DE, non-chr21", "not DE, chr21", "not DE, non-chr21")
+addDS <- addDS %>% dplyr::mutate(grp = factor(dplyr::case_when(
+   significant &  chr21 ~ LV[1],
+   significant & !chr21 ~ LV[2],
+  !significant &  chr21 ~ LV[3],
+  TRUE                  ~ LV[4]), levels = LV))
+
+## The called genes, plus SON. SON is not called -- its log2 fold change of 0.93
+## sits just under the cutoff -- but it carries the smallest adjusted p-value in
+## the analysis by a factor of fifty, and it is a chromosome 21 gene, so leaving
+## the highest point on the plot anonymous would be the more misleading choice.
+## Picked by rank, not by name, so it survives a re-run that shifts the numbers.
+labV <- dplyr::bind_rows(
+  addDS %>% dplyr::filter(significant),
+  addDS %>% dplyr::filter(!significant) %>% dplyr::slice_min(padj, n = 1, with_ties = FALSE)
+) %>% dplyr::distinct()
+xl <- max(abs(addDS$log2FC))
+
+## Identical name, breaks and guide in both scales: that is what makes ggplot
+## merge them rather than draw two legends. Layers stay separate for draw order.
+keyGuide <- guide_legend(override.aes = list(size = 3, colour = "white", stroke = 0.4))
+
+pVolc2 <- ggplot(addDS, aes(log2FC, -log10(padj))) +
+  ## Solid lines mark the origin, dashed lines the calling thresholds; drawn
+  ## first so both sit behind the points.
+  geom_hline(yintercept = 0, colour = "grey55") +
+  geom_vline(xintercept = 0, colour = "grey55") +
+  geom_hline(yintercept = -log10(FDR), linetype = "dashed", colour = "grey60") +
+  geom_vline(xintercept = c(-LFC_MIN, LFC_MIN), linetype = "dashed", colour = "grey60") +
+  geom_point(data = ~ dplyr::filter(.x, grp == LV[4]),
+             aes(shape = grp, fill = grp), colour = "grey85", size = 1.2, stroke = 0, alpha = 0.55) +
+  geom_point(data = ~ dplyr::filter(.x, grp == LV[3]),
+             aes(shape = grp, fill = grp), colour = "white", size = 2.7, stroke = 0.35) +
+  geom_point(data = ~ dplyr::filter(.x, significant),
+             aes(shape = grp, fill = grp), colour = "white", size = 3.6, stroke = 0.5) +
+  geom_text_repel(data = labV, aes(label = gene, fontface = ifelse(chr21, "bold", "plain")),
+                  size = 2.9, colour = "grey15", max.overlaps = Inf, box.padding = 0.45,
+                  segment.size = 0.2, segment.colour = "grey60", min.segment.length = 0) +
+  ## Both scales must carry identical name, breaks and limits, or ggplot draws
+  ## two legends instead of merging them into one.
+  scale_shape_manual(name = NULL, breaks = LV, limits = LV, drop = FALSE,
+                     values = setNames(c(22, 21, 22, 21), LV),
+                     guide = keyGuide) +
+  scale_fill_manual(name = NULL, breaks = LV, limits = LV, drop = FALSE,
+                    values = setNames(c("#B2182B", "#B2182B", "#2166ac", "grey85"), LV),
+                    guide = keyGuide) +
+  coord_cartesian(xlim = c(-xl, xl)) +
+  ## "FDR" rather than "BH-adjusted p": they are the same quantity, and every
+  ## threshold in this project is quoted as an FDR, so the axis should match.
+  labs(x = expression(log[2] * " fold change, DS vs Ctrl"),
+       y = expression(-log[10] * "(FDR)")) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "right", legend.text = element_text(size = 8.5),
+        legend.key.spacing.y = unit(3, "pt"))
+
+print(pVolc2)
+savePanel(pVolc2, "Step4_mastComb_additive_volcano", width = 7, height = 5.6)
+```
+
+## The called genes, donor by donor
+
+Both isotypes appear here. That is not a breakout of the estimate --- the model
+has only one --- it is the check on the assumption behind it. If the DS effect
+really is shared, each gene should shift the same way in the IgG block and the
+IgM block.
+
+```{r additive_heatmap, fig.width=8.5, fig.height=3.8}
+calledG <- addDS %>% dplyr::filter(significant) %>% dplyr::arrange(padj)
+if (nrow(calledG)) {
+  cpmC <- log2(t(t(counts[calledG$gene, , drop = FALSE]) / libsize) * 1e6 + 1)
+  hLong <- as.data.frame(as.table(cpmC)) %>%
+    stats::setNames(c("gene", "libid", "log2CPM")) %>%
+    dplyr::left_join(pooled %>% dplyr::select(libid, project, studyGroup, isotype), by = "libid") %>%
+    dplyr::group_by(gene, project, studyGroup, isotype) %>%
+    dplyr::summarise(log2CPM = mean(log2CPM), nCells = dplyr::n(), .groups = "drop") %>%
+    dplyr::group_by(gene) %>% dplyr::mutate(z = as.numeric(scale(log2CPM))) %>% dplyr::ungroup()
+  saveSource(hLong, "Step4_mastComb_additive_heatmap", "one row per gene x donor x isotype")
+
+  ordP <- pooled %>% dplyr::distinct(project, studyGroup) %>% dplyr::arrange(studyGroup, project)
+  geneOrd <- calledG %>% dplyr::arrange(dplyr::desc(chr21), padj) %>%
+    dplyr::mutate(lab = ifelse(chr21, paste0(gene, "  (chr21)"), gene))
+  ## Display labels only: "TC" is the internal study-group code and "IGHG"/"IGHM"
+  ## the internal isotype codes. The data, the source csv and every model keep
+  ## the original values; only the strips change.
+  hLong <- hLong %>% dplyr::mutate(
+    project    = factor(project, levels = ordP$project),
+    gene       = factor(gene, levels = rev(geneOrd$gene)),
+    studyGroup = factor(ifelse(studyGroup == "TC", "Ctrl", "DS"), levels = c("Ctrl", "DS")),
+    isotype    = factor(ifelse(isotype == "IGHG", "IgG", "IgM"), levels = c("IgG", "IgM")))
+  limZ <- max(abs(hLong$z), na.rm = TRUE)
+
+  pHeat <- ggplot(hLong, aes(project, gene, fill = z)) +
+    geom_tile(colour = "white", linewidth = 0.35) +
+    facet_grid(cols = vars(studyGroup, isotype), scales = "free_x", space = "free_x") +
+    scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#B2182B", midpoint = 0,
+                         limits = c(-limZ, limZ), name = "row z-score\nof log2(CPM+1)") +
+    scale_y_discrete(labels = setNames(geneOrd$lab, geneOrd$gene)) +
+    ## Bare for the composite: the gene count and the centring both belong in the
+    ## figure legend, not repeated on every panel.
+    labs(x = NULL, y = NULL) +
+    theme_minimal(base_size = 10) +
+    ## Donor identifiers removed: the facet strips already say which group and
+    ## isotype each column belongs to, and the individual IDs are not readable at
+    ## supplemental size. They remain in the source csv.
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+          axis.text.y = element_text(size = 8), panel.grid = element_blank(),
+          strip.text = element_text(face = "bold", size = 8))
+  print(pHeat)
+  savePanel(pHeat, "Step4_mastComb_additive_heatmap", width = 8.5, height = 3.8)
+
+  dirChk <- hLong %>% dplyr::group_by(gene, isotype, studyGroup) %>%
+    dplyr::summarise(m = mean(log2CPM), .groups = "drop") %>%
+    tidyr::pivot_wider(names_from = studyGroup, values_from = m) %>%
+    ## Ctrl, not TC: the strips were relabelled above and pivot_wider names the
+    ## column from the displayed value.
+    dplyr::mutate(shift = DS - Ctrl) %>% dplyr::select(gene, isotype, shift) %>%
+    tidyr::pivot_wider(names_from = isotype, values_from = shift) %>%
+    dplyr::mutate(sameDirection = sign(IgG) == sign(IgM))
+  print(kable(dirChk %>% dplyr::mutate(dplyr::across(c(IgG, IgM), ~ round(.x, 2))),
+              caption = "Shift in donor-mean log2(CPM+1), DS minus Ctrl, within each isotype"))
+  saveSource(dirChk, "Step4_mastComb_additive_direction_check", "one row per called gene")
+  cat(sprintf("\n%d of %d called genes shift the same way in both isotypes.\n",
+              sum(dirChk$sameDirection), nrow(dirChk)))
+} else cat("no gene called; nothing to draw\n")
+```
+
+# Gene set enrichment (cameraPR)
+
+Significance comes from `limma::cameraPR`, which corrects for inter-gene
+correlation, matching every other step-4 document. `fgsea` is deliberately not
+used: its null resamples genes as though they were independent, and on this
+dataset several sets clear fgsea FDR < 0.05 while none survives the correlation
+adjustment.
+
+Two statistics are tested: the pooled DS effect from the additive model, and the
+interaction term. Per-isotype enrichment is already in
+`P635_step4_DE_mast.Rmd` and is not repeated here.
+
+```{r gsea, fig.width=7.5, fig.height=5}
+hallmark <- tryCatch(msigdbr::msigdbr(species = "Homo sapiens", collection = GSEA_COLLECTION),
+                     error = function(e) msigdbr::msigdbr(species = "Homo sapiens",
+                                                          category = GSEA_COLLECTION))
+pathways <- split(hallmark$gene_symbol, hallmark$gs_name)
+
+## The additive DS effect only. The interaction term has no gene-level signal to
+## enrich, and a second panel invites the figure to be read as an isotype
+## breakout, which the additive model does not provide.
+camIn <- list("DS effect (pooled, additive model)" =
+                resAdd %>% dplyr::filter(coefficient == COEF_GROUP))
+cam <- dplyr::bind_rows(lapply(names(camIn), function(ef) {
+  d <- camIn[[ef]] %>% dplyr::filter(!is.na(padj), !is.na(p), !is.na(log2FC))
+  s <- sign(d$log2FC) * -log10(d$p); names(s) <- d$gene; s <- s[is.finite(s)]
+  idx <- limma::ids2indices(pathways, names(s))
+  idx <- idx[lengths(idx) >= GSEA_MIN_SIZE & lengths(idx) <= GSEA_MAX_SIZE]
+  cm <- limma::cameraPR(s, idx, sort = FALSE)
+  tibble::tibble(effect = ef, pathwayShort = sub("^HALLMARK_", "", rownames(cm)),
+                 nGenesInSet = cm$NGenes, direction = cm$Direction,
+                 cameraP = cm$PValue, cameraFDR = cm$FDR)
+}))
+saveSource(cam, "Step4_mastComb_GSEA_cameraPR", "one row per statistic x pathway")
+
+camSig <- cam %>% dplyr::filter(cameraFDR < GSEA_FDR) %>% dplyr::arrange(effect, cameraP)
+if (nrow(camSig)) {
+  kable(camSig %>% dplyr::transmute(effect, pathway = pathwayShort, direction,
+                                    cameraP = signif(cameraP, 3), cameraFDR = signif(cameraFDR, 3)),
+        caption = sprintf("Hallmark sets at cameraPR FDR < %.2f", GSEA_FDR))
+} else cat(sprintf("no hallmark set reaches cameraPR FDR < %.2f for either statistic\n", GSEA_FDR))
+
+kable(cam %>% dplyr::arrange(cameraP) %>% dplyr::slice_head(n = 10) %>%
+        dplyr::transmute(effect, pathway = pathwayShort, direction,
+                         cameraP = signif(cameraP, 2), cameraFDR = signif(cameraFDR, 2), nGenesInSet),
+      caption = "Ten smallest cameraPR p-values across both statistics")
+
+highlight <- union(
+  cam %>% dplyr::group_by(pathwayShort) %>%
+    dplyr::summarise(bestP = min(cameraP), .groups = "drop") %>%
+    dplyr::slice_min(bestP, n = GSEA_N_SHOW, with_ties = FALSE) %>% dplyr::pull(pathwayShort),
+  camSig$pathwayShort) %>% unique()
+## The axis is the FDR, not the raw p, so that bar length and bar colour encode
+## the same quantity: a bar crosses the dashed line exactly when it is coloured
+## as significant. Plotting -log10(p) against an FDR-based colour let a long bar
+## sit next to a "n.s." label with nothing on the figure to explain the gap.
+pGsea <- cam %>% dplyr::filter(pathwayShort %in% highlight) %>%
+  dplyr::mutate(signedLogFDR = ifelse(direction == "Up", 1, -1) * -log10(cameraFDR)) %>%
+  ggplot(aes(signedLogFDR, reorder(pathwayShort, signedLogFDR),
+             fill = cameraFDR < GSEA_FDR)) +
+  geom_col(width = 0.72) +
+  geom_vline(xintercept = 0, colour = "grey60") +
+  geom_vline(xintercept = c(-1, 1) * -log10(GSEA_FDR), linetype = "dashed", colour = "grey55") +
+  scale_fill_manual(values = c(`TRUE` = "firebrick", `FALSE` = "grey75"),
+                    labels = c(`TRUE` = sprintf("cameraPR FDR < %.2f", GSEA_FDR),
+                               `FALSE` = "n.s."), name = NULL) +
+  labs(x = bquote("signed " * -log[10] * "(cameraPR FDR)   (positive: up in DS; dashed: FDR " * .(GSEA_FDR) * ")"),
+       y = NULL) +
+  theme_classic(base_size = 11) +
+  ## A one-entry legend reading "n.s." carries no information the dashed
+  ## threshold does not already give. Made conditional rather than deleted, so a
+  ## re-run that does find something still labels it.
+  theme(legend.position = if (nrow(camSig)) "right" else "none")
+print(pGsea)
+savePanel(pGsea, "Step4_mastComb_GSEA_cameraPR", width = 7.5, height = 5)
+```
+
+# Supplemental figure
+
+The three panels of the combined-isotype analysis assembled into one figure:
+**A** the DS effect from the additive model, **B** the genes it called shown
+donor by donor, **C** hallmark enrichment of the same ranking.
+
+One column, A over B over C. Panel titles and subtitles are stripped from all
+three: in a composite that text belongs in the figure legend, and leaving it on
+some panels but not others reads as an oversight.
+
+```{r supplemental_figure, fig.width=8.5, fig.height=12.1}
+haveAll <- all(vapply(c("pVolc2", "pHeat", "pGsea"), exists, logical(1)))
+if (haveAll) {
+  ## Heights, not equal thirds: the heatmap is only seven rows deep and the
+  ## volcano needs the most vertical room for its labels.
+  ## free(type = "label", side = "l") exempts the volcano's y-axis title from the
+  ## left-edge alignment. Without it patchwork widens the axis-text column to fit
+  ## B's gene names and C's pathway names, and A's short "0 1 2 3" leaves its
+  ## title stranded at the far left. No vjust or margin can close that gap --
+  ## the title and the axis text sit in different grid columns.
+  ## Legend text is built from the figures themselves so it cannot drift out of
+  ## step with the panels; strwrap does the line breaking, since a patchwork
+  ## caption does not wrap on its own.
+  nBoth <- sum(donorTab$bothIsotypes)
+  capTxt <- sprintf(paste(
+    "Supplemental Figure. Differential expression between DS and Ctrl in spike-specific B cells,",
+    "modelled across both isotypes at once (MAST, donor random effect).",
+    "%d cells from %d donors (%d IgG, %d IgM; %d donors contributed both isotypes).",
+    "(A) Volcano of the %s genes tested; %d called at FDR < %.2f and |log2FC| > %g, %d of them on chr21.",
+    "SON is labelled although its fold change falls just below the cutoff.",
+    "(B) Donor means per isotype for the called genes; rows centred and scaled.",
+    "(C) Hallmark gene sets ranked by cameraPR. Dashed lines mark FDR %.2f throughout."),
+    nrow(pooled), dplyr::n_distinct(pooled$donorId),
+    sum(pooled$isotype == "IGHG"), sum(pooled$isotype == "IGHM"), nBoth,
+    format(nrow(addDS), big.mark = ","), sum(addDS$significant), FDR, LFC_MIN,
+    sum(addDS$significant & addDS$chr21), FDR)
+  capTxt <- paste(strwrap(capTxt, width = 112), collapse = "\n")
+
+  suppFig <- patchwork::free(pVolc2, type = "label", side = "l") / pHeat / pGsea +
+    patchwork::plot_layout(heights = c(1, 0.62, 0.88)) +
+    patchwork::plot_annotation(
+      tag_levels = "A", caption = capTxt,
+      theme = ggplot2::theme(
+        plot.caption = ggplot2::element_text(hjust = 0, size = 8.2, lineheight = 1.3,
+                                             margin = ggplot2::margin(t = 12)))) &
+    ggplot2::theme(plot.tag = ggplot2::element_text(face = "bold", size = 14))
+  print(suppFig)
+  savePanel(suppFig, "SupplFig_mastComb_ABC", width = 8.5, height = 12.1)
+  cat("\n--- legend as placed on the figure ---\n"); cat(capTxt, "\n")
+  cat("wrote SupplFig_mastComb_ABC (A volcano, B heatmap, C hallmark GSEA)\n")
+} else {
+  cat(sprintf("missing panel object(s): %s -- supplemental figure not assembled\n",
+              paste(setdiff(c("pVolc2", "pHeat", "pGsea"),
+                            Filter(exists, c("pVolc2", "pHeat", "pGsea"))), collapse = ", ")))
+}
+```
+
+# What this shows
+
+```{r bottom_line, echo=FALSE, results='asis'}
+nSigInt <- sum(intOnly$significant)
+permTxt <- if (RUN_PERM && !is.null(permNull))
+  sprintf(" Under %d permutations of the group labels the same test called a median of %g genes (max %g), so the observed count is%s what label shuffling produces.",
+          length(permNull), median(permNull), max(permNull),
+          if (nSigInt > max(permNull)) " above" else " indistinguishable from") else ""
+
+cat(sprintf("
+1. **The interaction test finds %d gene%s.** Of %d genes tested, %d fall below p = 0.05
+   against %d expected by chance (ratio %.2f), and the smallest adjusted p-value is %s.%s
+
+2. **The additive model is therefore sufficient.** Constraining the DS effect to be the
+   same in IgG and IgM costs nothing in fit for any gene, which is the formal version of
+   what the concordance scatterplots showed descriptively.
+
+3. **This does not mean the isotypes are biologically identical.** It means that at
+   %d cells from %d donors, with no gene-level DS signal in either isotype to begin with,
+   there is no difference between two effects that are both indistinguishable from zero.
+   A test for a difference between two nulls is not informative about biology.
+",
+nSigInt, if (nSigInt == 1) "" else "s", nrow(intOnly),
+sum(intOnly$p < 0.05), round(0.05 * nrow(intOnly)),
+sum(intOnly$p < 0.05) / (0.05 * nrow(intOnly)),
+format(signif(min(intOnly$padj), 3)), permTxt,
+nrow(pooled), dplyr::n_distinct(pooled$donorId)))
+```
+
+# Save
+
+```{r save}
+step4comb <- list(additive = resAdd, interaction = resInt, pooled = pooled,
+                  donorTable = donorTab, evidence = evid, permutation = permNull, permutationGroup = permGroup,
+                  params = list(MIN_CELLS = MIN_CELLS, CELL_DETECT = CELL_DETECT,
+                                formulaAdd = deparse(FORMULA_ADD),
+                                formulaInt = deparse(FORMULA_INT),
+                                FDR = FDR, LFC_MIN = LFC_MIN, N_PERM_INT = N_PERM_INT, N_PERM_GROUP = N_PERM_GROUP, SEED = SEED),
+                  sessionInfo = sessionInfo())
+saveRDS(step4comb, file.path(OUT_DIR, "step4_differential_expression_mast_combined.rds"))
+cat(sprintf("wrote %s\n", file.path(OUT_DIR, "step4_differential_expression_mast_combined.rds")))
+```
+
+```{r session}
+sessionInfo()
+```

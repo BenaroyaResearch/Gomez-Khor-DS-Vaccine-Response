@@ -1,0 +1,570 @@
+---
+title: "Covid vax response in Flow and CyTOF data"
+author: "Rebecca Gomez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---   
+
+```{r load libraries, echo = FALSE, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(data.table)
+library(knitr)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+
+library(readxl) # open excels
+library(circlize) # color gradients
+
+# library(flowWorkspace)
+# library(CytoML)
+# library(IMPACD)
+
+library(UpSetR)
+library(tidyverse)
+library(betareg)
+library(limma)
+library(emmeans)
+library(circlize)
+library(ComplexHeatmap)
+library(openxlsx)
+library(VennDiagram)
+```
+
+```{r load and set defaults}
+# opts_chunk$set(fig.width=6, fig.height=4.0, cache = TRUE, echo=FALSE, warning=FALSE, message=FALSE, results='hide')
+opts_chunk$set(fig.width=6, fig.height=5, cache = TRUE, warning=FALSE, message=FALSE, fig.align = 'center')
+
+source("R/project_settings.R")
+source("R/abTiter_analysis_RG_2025_06.R")
+getwd() #find out where working directory is set
+setwd("~/Khor_covidvax_response_IMPACD") #set working directory
+
+baseDir = getwd()
+dataDir = file.path(baseDir, 'data_RG_2025_05')
+plotsDir = file.path(baseDir, 'plots_RG_2025_05')
+resultsDir = file.path(baseDir, 'results_RG_2025_05')
+tablesDir = file.path(baseDir, 'tables_RG_2025_05')
+fcsDir = file.path(baseDir, "fcs_files_RG_2025_05")
+
+dirs_to_create <- list(dataDir, plotsDir, resultsDir, tablesDir, fcsDir)
+lapply(dirs_to_create, dir.create, recursive = TRUE, showWarnings = FALSE)
+
+resultsDir = file.path(resultsDir, "vax_response", "discovery")
+dir.create(resultsDir, recursive = T, showWarnings = F)
+
+
+```
+
+
+```{r get abTiter and time point info}
+abTiterData = read.csv("/Users/rgomez/Khor_covidvax_response_IMPACD/tables/donorIds_and_abTiter.csv") # this file was generated with model_vax_response.Rmd
+timePoints = read.csv("/Users/rgomez/Khor_covidvax_response_IMPACD/tables/timePoints.csv")
+```
+
+# Flow data Modeling
+```{r load the flow data}
+
+# list all R data files in data/counts
+dir_ = "data/counts/flow"
+files = list.files(dir_, pattern = ".Rdata", full.names = T)
+
+file = files[1]
+name = str_remove(gsub(dir_, "", file), "^/")
+name = gsub(".Rdata", "", name)
+cellSubset = name
+
+# for (iFile in 1:length(files) ) {
+#   file = files[iFile]
+#   # extract the name of the file, without the path and extension
+#   name = gsub("data/counts/", "", file)
+#   name = gsub(".Rdata", "", name)
+#   
+#   break
+#   
+# }
+
+
+```
+
+
+```{r the helper functions}
+runAbTiterModel = function(pctParent, popCounts, weights, design, family = "gaussian", includeSex = T, cutOff = 10) {
+  #'@title runModel
+  #'@description This function runs a linear model on the CyTOF data. It uses the pctParent, popCounts, weights and design data to fit a linear model using age, sex, and studyGroup as covariates. The function returns a list of models. Fits are only returned for subsets where the median count of at least on study group is greater than the cutOff.
+  #'@param pctParent Matrix of percent parent data, with rows corresponding to subsets and columns corresponding to samples.
+  #'@param popCounts Matrix of population counts, with rows corresponding to subsets and columns corresponding to samples.
+  #'@param weights Matrix of weights (parent counts), with rows corresponding to subsets and columns corresponding to samples.
+  #'@param design Table with meta data
+  #'@param family Modeling family
+  #'@param cutOff Optional (default = 10), minimum median count for a subset to be included in the analysis
+  #'@return A list of fits.
+  
+  models = list()
+    
+  message("Running linear model using ", family, " response for AbTiter at T3 for ", nrow(pctParent), " subsets")
+  
+  pb <- txtProgressBar(min = 0, max = nrow(pctParent), style = 3)
+  i = 0
+  
+  zeroCounts = c()
+  
+  for (subset_ in row.names(pctParent)) {
+    # update the progress bar
+    i = i + 1
+    setTxtProgressBar(pb, i)
+    
+    data = data.frame(ALId = colnames(pctParent),
+                      pctParent = as.numeric(pctParent[subset_,]),
+                      count = as.numeric(popCounts[subset_,]),
+                      weights = as.numeric(weights[subset_,])
+    )
+    
+    data = merge(data, design, by.x = "ALId", by.y = "ALId")
+    # summarize data, get median for count by studygroup
+    medianCount = data %>%
+      group_by(studyGroup) %>%
+      summarize(medianCount = median(count))
+    
+    if (!any(medianCount$medianCount >= cutOff)) {
+      zeroCounts = c(zeroCounts, subset_)
+      next
+    }
+    
+    if (length( unique(data$pctParent[!is.na(data$pctParent)]) ) <= 1) {
+      zeroCounts = c(zeroCounts, subset_)
+      next
+    }
+    
+    if (family == "gaussian") {
+      data$weights[data$weights == 0] = 1e-10
+      
+      # if (includeSex) {
+      #   fit = glm(pctParent ~ studyGroup*sex*ageAtDraw, data = data, weights = data$weights)
+      # } else {
+        fit = glm(abTiter_T3 ~ studyGroup * pctParent, data = data, weights = data$weights)
+      # }
+      
+    } else if (family == "binomial") {
+      
+      # # have to think about the weights - with a binomial model, they have to be integers (correspond to the "number of trials")
+      # data$weights = round(data$weights)
+      # data$weights = as.integer(data$weights)
+      # 
+      # data$pctParent = data$pctParent/100
+      # fit = glm(pctParent ~ studyGroup*sex*ageAtDraw, data = data, weights = data$weights, family = binomial(link = "logit"))
+    } else if (family == "beta") {
+      # need to implement beta
+      # this might help with including that + random effect even maybe?
+      # https://www.reddit.com/r/rstats/comments/16azcem/family_choice_for_glm_with_01_dependent_variable/
+    }
+    
+    models[[subset_]] = fit
+    
+  }
+  # close the progress bar
+  close(pb)
+  
+  return(models)
+}
+
+testVaxResponse <- function(models, subsets, design, pctParent, popCounts, weights) {
+  # If there were no models, bail out immediately
+  if (length(models) == 0) {
+    message("No models to test; returning empty stats.")
+    return(data.frame())
+  }
+
+  # Message
+  message("Testing for effects of vax response in ", length(models), " subsets")
+
+  # Initialize
+  stats <- NULL
+  pb    <- txtProgressBar(min = 0, max = length(models), style = 3)
+  i = 0
+  emm_options("msg.interaction" = FALSE)
+  AICs = c()
+  for (subset_ in names(models)) {
+    i = i + 1
+    setTxtProgressBar(pb, i)
+    
+    # try to run model, if it fails, add an empty line for stats
+    tryCatch({
+        trends <- emtrends(models[[subset_]], 
+                           ~ studyGroup, 
+                           var = "pctParent")
+    
+      trends = test(trends)
+      
+      trends$subset = subset_
+      
+    }, error = function(e) {
+      print(subset_)
+      trends = data.frame(subset = subset_)
+    })
+    
+    stats = rbind(stats, trends)
+    
+    AICs = c(AICs, AIC(models[[subset_]]))
+  
+    
+  }
+  # close the progress bar
+  close(pb)
+  
+  emm_options("msg.interaction" = TRUE)
+  
+  names(AICs) = names(models)
+  stats = merge(stats, subsets, by = "subset")
+  
+  
+  stats$comparison = paste0(stats$studyGroup, " ab Titer effect")
+  comparisons = unique(stats$comparison)
+  
+  
+  message("Calculating summary statistics")
+  summaryStats = c()
+  
+  pb <- txtProgressBar(min = 0, max = length(comparisons), style = 3)
+  i = 0
+  
+  summaryStats = c()
+  for (comparison_ in comparisons) {
+    stats_ = stats %>% 
+      dplyr::filter(comparison == comparison_) %>%
+      dplyr::select(comparison, subset, studyGroup)
+    
+    studyGroup_ = unique(stats_$studyGroup)
+    
+    study_samples = dplyr::filter(design, studyGroup == studyGroup_)$ALId
+    
+    counts_study = popCounts[stats_$subset , study_samples]
+    pctParent_study = pctParent[stats_$subset, study_samples]
+    weights_study = weights[stats_$subset, study_samples]
+    
+    # calculate the median and sd of the counts
+    # we have to make sure that we do this based on only the samples that had a 
+    # nonzero count in the parent population (which is what we use the weights for)
+    for (iSubset in 1:nrow(stats_) ) {
+      study_idx = weights_study[iSubset, ] > 0
+      
+      counts_study_subset = as.numeric(counts_study[iSubset, study_idx])
+      pctParent_study_subset = as.numeric(pctParent_study[iSubset, study_idx])
+      
+      stats_$medianCounts[iSubset] =   median(counts_study_subset)
+      stats_$meanCounts[iSubset] =     mean(counts_study_subset)
+      stats_$sdCounts[iSubset] =       sd(counts_study_subset)
+      
+      stats_$medianPctParent[iSubset] = median(pctParent_study_subset)
+      stats_$meanPctParent[iSubset] =   mean(pctParent_study_subset)
+      stats_$sdPctParent[iSubset] =     sd(pctParent_study_subset)
+      
+    }
+    
+    #merge into stats
+    summaryStats = rbind(summaryStats, stats_)
+    i = i + 1
+    setTxtProgressBar(pb, i)
+  }
+  
+  close(pb)
+  
+  summaryStats = dplyr::select(summaryStats, -studyGroup)
+  
+  stats = merge(stats, summaryStats, by = c("comparison", "subset"))
+  
+  stats = multipleTestCorrection(stats)
+  
+  # add AICs to stats
+  stats$AIC = AICs[match(stats$subset, names(AICs))]
+  
+  
+  return(stats)
+}
+```
+
+
+```{r develop the analysis}
+
+message("Starting analysis of ", str_replace_all(cellSubset, "_", "/"))
+
+# Defaults -------------------------------------------------------------------
+fdrCutoff = 0.05
+pCutoff = 0.05 # for modifier analysis
+medianCellCutoff = 10
+analysis = "abTiter response"
+  
+# Set up directories ---------------------------------------------------------
+statsDir =    file.path(resultsDir, "stats") # all the statistics before any level 1 or modifier analysis
+level1Dir =   file.path(resultsDir, "level1")
+modifierDir = file.path(resultsDir, "modifierAnalysis")
+  
+dir.create(statsDir, showWarnings = FALSE, recursive = TRUE)
+dir.create(level1Dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(modifierDir, showWarnings = FALSE, recursive = TRUE)
+  
+# Load and prep data ---------------------------------------------------------
+filePath = file.path(dir_, paste0(cellSubset, ".Rdata") )
+
+load(filePath)
+  
+pctParent = matrices[["pctParent"]]
+popCounts = matrices[["popCounts"]]
+parentCounts = matrices[["parentCounts"]]
+  
+nodes = matrices[["nodes"]]
+design = matrices[["design"]]
+
+design = dplyr::filter(design, !control)  
+design$studyGroup = "DS"
+design$studyGroup[design$patientType == "Control"] = "TC"
+design$studyGroup = factor(design$studyGroup, levels = c("TC", "DS"))
+design$sex = factor(design$sex, levels = sort(unique(design$sex)))
+  
+# add the abTiter and timePoint info
+# design = merge(design, abTiterData, by = "khorLabId", all.x = T)
+# design = merge(design, timePoints, by = "testId", all.x = T)
+design$abTiter_T3 <- abTiterData$abTiter_T3[
+  match(design$khorLabId, abTiterData$khorLabId)
+]
+design$timePoint   <- timePoints$timePoint[
+  match(design$testId, timePoints$testId)
+]
+design <- design[!is.na(design$abTiter_T3), ]
+
+design = dplyr::filter(design, !is.na(abTiter_T3) ) # remove samples with missing ab Titer info
+# now subset your three matrices in one go:
+if (!is.null(colnames(pctParent)) && length(colnames(pctParent))>0) {
+  # subset by matching names
+  keep_idx <- match(as.character(design$ALId), colnames(pctParent))
+  if (anyNA(keep_idx)) {
+    warning(
+      "Dropping ", sum(is.na(keep_idx)),
+      " design$ALId not found in pctParent colnames: ",
+      paste(design$ALId[is.na(keep_idx)], collapse=", ")
+    )
+  }
+  keep_idx <- keep_idx[!is.na(keep_idx)]
+} else {
+  # no column names: treat design$ALId as positions
+  keep_idx <- as.integer(design$ALId)
+  bad      <- keep_idx < 1 | keep_idx > ncol(pctParent)
+  if (any(bad)) {
+    warning(
+      "Dropping ", sum(bad),
+      " out‑of‑range ALId positions: ",
+      paste(design$ALId[bad], collapse=", ")
+    )
+  }
+  keep_idx <- keep_idx[!bad]
+}
+
+pctParent    <- pctParent[,    keep_idx, drop=FALSE]
+popCounts    <- popCounts[,    keep_idx, drop=FALSE]
+parentCounts <- parentCounts[, keep_idx, drop=FALSE]
+
+# sanity check
+message("Now have ", ncol(pctParent), " samples in pctParent & design: ",
+        length(keep_idx), " rows in design")
+
+table(design$timePoint, design$studyGroup)
+
+# for now, subset to just the T3 timepoint
+design_ = dplyr::filter(design, timePoint == "T3")
+# 1) If ALId got turned into rownames, bring it back:
+if (!"ALId" %in% colnames(design_)) {
+  design_$ALId <- rownames(design_)
+}
+# 2) Drop any duplicated columns just in case:
+design_ <- design_[ , !duplicated(colnames(design_))]
+
+
+# global compartment analysis ------------------------------------------------
+nodes_ = dplyr::filter(nodes, compartment == "global") # remove all nodes that are part of the rootpath
+
+# only keep ALIds actually present in pctParent
+valid_ALIDs <- intersect(design_$ALId, colnames(pctParent))
+if (length(valid_ALIDs) < length(design_$ALId)) {
+  warning(
+    "Dropping ",
+    length(design_$ALId) - length(valid_ALIDs),
+    " samples not found in pctParent/popCounts matrix"
+  )
+}
+pctParent_    <- pctParent[nodes_$subset,   valid_ALIDs, drop = FALSE]
+popCounts_    <- popCounts[nodes_$subset,   valid_ALIDs, drop = FALSE]
+parentCounts_ <- parentCounts[nodes_$subset, valid_ALIDs, drop = FALSE]
+
+nodes_$subset = nodes_$pathInCompartment
+
+rownames(pctParent_) = nodes_$subset
+rownames(popCounts_) = nodes_$subset
+rownames(parentCounts_) = nodes_$subset
+
+models = runAbTiterModel(pctParent_, popCounts_, parentCounts_, design_, family = "gaussian", cutOff = medianCellCutoff)
+
+stats = testVaxResponse(models, nodes_, design_, pctParent_, popCounts_, parentCounts_)
+
+stats$timePoint = "T3"
+stats$compartment = "global"
+
+stats$comparison = paste0(stats$comparison, " at ", stats$timePoint, " in ", stats$compartment)
+
+modifierAnalysis = modifierAnalysisAbTiter(stats, design_, pctParent_, parentCounts_, fdrCutoff = fdrCutoff, pCutoff = pCutoff)
+
+modifierHits = modifierAnalysis$modifierHits
+modifierResults = modifierAnalysis$modifierResults
+modifierComparisons = modifierAnalysis$modifierComparisons
+
+modifierHits$timePoint = "T3"
+modifierHits$compartment = "global"
+
+
+# antigen compartment analysis ------------------------------------------------
+nodes_ = dplyr::filter(nodes, compartment == "antigen-specific") # remove all nodes that are part of the rootpath
+
+pctParent_ = pctParent[nodes_$subset, design_$ALId]
+popCounts_ = popCounts[nodes_$subset, design_$ALId]
+parentCounts_ = parentCounts[nodes_$subset, design_$ALId]
+
+nodes_$subset = nodes_$pathInCompartment
+
+rownames(pctParent_) = nodes_$subset
+rownames(popCounts_) = nodes_$subset
+rownames(parentCounts_) = nodes_$subset
+
+modelsAg = runAbTiterModel(pctParent_, popCounts_, parentCounts_, design_, family = "gaussian", cutOff = medianCellCutoff)
+
+statsAg = testVaxResponse(modelsAg, nodes_, design_, pctParent_, popCounts_, parentCounts_)
+
+statsAg$timePoint = "T3"
+statsAg$compartment = "antigen-specific"
+
+statsAg$comparison = paste0(statsAg$comparison, " at ", statsAg$timePoint, " in ", statsAg$compartment)
+
+modifierAnalysisAg = modifierAnalysisAbTiter(statsAg, design_, pctParent_, parentCounts_, fdrCutoff = fdrCutoff, pCutoff = pCutoff)
+
+modifierHitsAg = modifierAnalysisAg$modifierHits
+modifierResultsAg = modifierAnalysisAg$modifierResults
+modifierComparisonsAg = modifierAnalysisAg$modifierComparisons
+
+modifierHitsAg$timePoint = "T3"
+modifierHitsAg$compartment = "global"
+
+stats = rbind(stats, statsAg)
+modifierHits = rbind(modifierHits, modifierHitsAg)
+
+save(stats, modifierHits, file = file.path(dataDir, paste0("flowBcell_abTiter_first_pass", ".Rdata")))
+
+```
+
+
+
+
+```{r this is part of the flow for cytyof}
+# remove all the T2 and T3
+design = dplyr::filter(design, timePoint == "T1")
+
+table(design$ageAtDraw)
+
+# matrices already had IC removed, but now I am just going to make sure they are in the same order
+# and also remove unused timePoints
+pctParent = pctParent[, design$ALId]
+popCounts = popCounts[, design$ALId]
+parentCounts = parentCounts[, design$ALId]
+
+weights = parentCounts
+
+
+nodes = dplyr::filter(nodes, !is.na(subset)) # remove all nodes that are part of the rootpath
+
+# somehow "HLA-DR+/HLA-DR+ snuck into the data, we can just filter it out
+nodes = dplyr::filter(nodes, str_count(pathInCompartment, "HLA\\-DR\\+") < 2)
+pctParent = pctParent[nodes$subset, ]
+popCounts = popCounts[nodes$subset, ]
+weights = weights[nodes$subset, ]
+
+subsets = nodes
+  
+# Run linear model -----------------------------------------------------------
+models = runAbTiterModel(pctParent, popCounts, weights, design, family = "gaussian", cutOff = medianCellCutoff)
+  
+if (length(models) == 0) {
+  message("No significant relatioships for AbTiter.")
+  return(NULL)
+}
+  
+# Create contrasts -----------------------------------------------------------
+stats = testVaxResponse(models, subsets, design, pctParent, popCounts, weights)
+
+
+level1Results = getLevel1(stats)
+
+
+makeAbBoxplots(level1Results, pctParent, weights, design, models, colors)
+  
+# Save results to spreadsheets -----------------------------------------------
+saveToSpreadsheet(stats, file.path(statsDir, paste0(cellSubset, "_stats.xlsx")))
+saveToSpreadsheet(level1Results, file.path(level1Dir, paste0(cellSubset, "_level1.xlsx")))
+  
+# Run modifier analysis ------------------------------------------------------
+if (nrow(dplyr::filter(stats, fdr < fdrCutoff)) == 0) {
+  message("No significant results for ", cellSubset)
+  return(NULL)
+  }
+  
+modifierAnalysis = modifierAnalysisAbTiter(stats, design, pctParent, weights, fdrCutoff = fdrCutoff, pCutoff = pCutoff)
+  
+
+modifierHits = modifierAnalysis$modifierHits
+modifierResults = modifierAnalysis$modifierResults
+modifierComparisons = modifierAnalysis$modifierComparisons
+  
+  # Save modifier results to spreadsheet ---------------------------------------
+saveModifierResultsToSpreadsheet(modifierHits, modifierResults, modifierComparisons, file.path(modifierDir, paste0(cellSubset, "_modifierAnalysis.xlsx")))
+  
+  results = list(models = models, stats = stats, modifierHits = modifierHits, modifierResults = modifierResults, modifierComparisons = modifierComparisons)
+  dir.create(file.path("analysis_results", analysis), showWarnings = FALSE, recursive = TRUE)
+  save(results, file = file.path("analysis_results", analysis, paste0(cellSubset, ".Rdata")))
+  
+  # Level 1 heatmap ------------------------------------------------------------
+  hmtitle = paste0("Sig. level 1 of ", str_replace_all(cellSubset, "_", "/"))
+  filePath = file.path(level1Plots, paste0("hm_", cellSubset, ".png"))
+  
+  # Make heatmap
+  hm = makeHeatmap(level1Results, pctParent, design, colors, hmtitle, filePath = filePath)
+  
+  # Level 1 boxplots -----------------------------------------------------------
+  # Regular 
+  title = paste0("Level 1 of ", str_replace_all(cellSubset, "_", "/"))
+  filePath = file.path(level1Plots, paste0("box_", cellSubset, ".png"))
+  
+  makeBoxplots(level1Results, pctParent, weights, design, colors, filePath = filePath, title = title, add_stats = F)
+  
+  # With stats
+  title = paste0("Level 1 of ", str_replace_all(cellSubset, "_", "/"), " with significance indicator")
+  filePath = file.path(level1Plots, paste0("box_", cellSubset, "_with_significance.png"))
+  
+  makeBoxplots(level1Results, pctParent, weights, design, colors, filePath = filePath, title = title, add_stats = T)
+  
+  # Modifier analysis heatmap --------------------------------------------------
+  filePath = file.path(modifierPlots, paste0("hm_", cellSubset, ".png"))
+  
+  hmtitle = paste0("Modifier analysis results of ", str_replace_all(cellSubset, "_", "/"))
+  
+  hm = makeHeatmap(modifierResults, pctParent, design, colors, hmtitle, filePath = filePath)
+  
+  # Return ---------------------------------------------------------------------
+  return(NULL)
+  
+}
+
+```

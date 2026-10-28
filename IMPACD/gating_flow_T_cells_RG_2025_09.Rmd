@@ -1,0 +1,2796 @@
+---
+title: "Covid vax response - T cells IMPACD and analysis"
+author: "Stephan Pribitzer"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---   
+
+```{r set up directories, echo = FALSE, message = FALSE, warning = FALSE}
+source("R/project_settings.R")
+```
+
+```{r load libraries, echo = FALSE, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(data.table)
+library(knitr)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+
+library(readxl) # open excels
+library(circlize) # color gradients
+
+library(flowWorkspace)
+library(CytoML)
+library(IMPACD)
+
+library(UpSetR)
+library(tidyverse)
+library(betareg)
+library(limma)
+library(emmeans)
+library(circlize)
+library(ComplexHeatmap)
+library(openxlsx)
+library(VennDiagram)
+```
+
+```{r knitr defaults}
+# opts_chunk$set(fig.width=6, fig.height=4.0, cache = TRUE, echo=FALSE, warning=FALSE, message=FALSE, results='hide')
+opts_chunk$set(fig.width=6, fig.height=5, cache = TRUE, warning=FALSE, message=FALSE, fig.align = 'center')
+
+```
+
+
+# T-cells
+
+## Validate gate names, coordinates and populations
+
+### Load workspace and set up design
+```{r load flowJo workspace}
+wsfile = file.path(fcsDir, "T cell panel/T cell_hierarchical and ALL parameter gating/2024-05-14 D4/2024-05-14_Tpanel_gating_debarcoded_exp_ICs_all_batches_D4.wsp")
+ws = open_flowjo_xml(wsfile)
+
+summary(ws)
+
+gs_flowJo = flowjo_to_gatingset(ws, 
+                                  skip_faulty_gate = TRUE, 
+                                  name = 1,
+                                  path = file.path(fcsDir, "T cell panel/T panel_FCS files_exported de-barcoded"))
+
+plot(gs_flowJo)
+
+
+# nodelist = gs_get_pop_paths(gs_flowJo, path = 1)
+nodelist = gs_get_pop_paths(gs_flowJo, path = "full")
+print(nodelist)
+
+```
+
+```{r load the annotations}
+annotations_ = read_excel("tables/annotation_cleaned.xlsx", sheet = 1)
+
+# add a column ALid that is "AL" + the number, make sure the number is three digits, with leading zeros if needed
+annotations_$ALId = paste0("AL", formatC(as.numeric(annotations_$Alnumber), width = 3, format = "d", flag = "0"))
+annotations_ = dplyr::select(annotations_, -Alnumber)
+
+annotations_2 = read_excel("tables/annotation_cleaned.xlsx", sheet = 2)
+
+setdiff(annotations_2$testId, annotations_$testId)
+
+annotations = merge(annotations_, annotations_2, by = "testId", all.x = TRUE, all.y = TRUE) 
+
+missingAL = dplyr::filter(annotations, is.na(ALId))
+annotations = dplyr::filter(annotations, !is.na(ALId))
+
+```
+
+```{r create the design matrix}
+fcsFiles = list.files(file.path(fcsDir, "T cell panel/T panel_FCS files_exported de-barcoded"), pattern = ".fcs$", full.names = TRUE)
+
+# remove exp_A_DMSO_only_B07_IC07.fcs from fcsFiles. I think this was created by accident?
+fcsFiles = fcsFiles[!str_detect(fcsFiles, "exp_A_DMSO_only_B07_IC07.fcs")]
+
+design = data.frame(fcsFiles = fcsFiles)
+
+design$fcsName = basename(design$fcsFiles)
+design$sampleName = gsub(".fcs", "", design$fcsName)
+```
+
+```{r add annotations to the design matrix}
+# extract ALnumber from design$sample_name
+design$ALId = gsub(".*AL([0-9]+).*", "AL\\1", design$sample)
+
+design$control = str_detect(design$sampleName, "IC")
+design$ALId[design$control] = NA
+
+design = merge(design, annotations, by = "ALId", all.x = TRUE)
+
+setdiff(annotations$ALId, design$ALId)
+```
+
+```{r add batch ID to design matrix}
+
+# add batch ID to design matrix:
+design$batch = as.numeric(gsub(".*B([0-9]+).*", "\\1", design$sampleName))
+
+# identify conditions, by splitting sample name by _ and taking the third element
+design$condition = sapply(strsplit(design$sampleName, "_"), function(x) x[3])
+design$experiment = sapply(strsplit(design$sampleName, "_"), function(x) x[2])
+
+# make condition long if condition DM = DMSO, SP = Spike, CE = CEFX and MN = MN
+design$conditionLong =  ifelse(design$condition == "DM", "DMSO", 
+                        ifelse(design$condition == "SP", "spike", 
+                        ifelse(design$condition == "CE", "CEFX", 
+                               design$condition) ) ) 
+
+
+table(design$condition)
+table(design$batch, design$condition)
+table(design$control, design$condition)
+table(design$ALId)
+
+```
+
+## Setup gates
+
+
+```{r try to work through the gating}
+gateList = data.frame(flowJoName = nodelist)
+
+# write to csv so I can open in excel and figure out a pattern
+write.csv(gateList, file = "tables/Tcell_gateList.csv", row.names = FALSE)
+
+
+# There appear to be 3 "levels" of nodes. We start with a topLevel path
+# /LYM/BC/Live that all of our populations relate to
+topLevel = c("LYM", "BC", "Live")
+
+# after that comes a set of X nodes that are all applied to that level
+
+# then we go into CD4/CD8 specific gating. For that we append CD3+dump-/NKT/TCRgd+ to the toplevel
+# /LYM/BC/Live/CD3+dump-/NKT/TCRgd+
+CD48 = c("CD3+ dump-", "NKT", "TCRgd+")
+
+# then we have the CD4+ specific gating
+# /LYM/BC/Live/CD3+dump-/NKT/TCRgd+/CD4+/Treg/ and /LYM/BC/Live/CD3+dump-/NKT/TCRgd+/CD4+/CXCR3_dim+
+# I wonder if /LYM/BC/Live/CD3+dump-/NKT/TCRgd+/CD4+/CXCR3_dim+ is a mistake and shouldn't be there - because it is the only gate that appears multiple times
+# and breaks the code from last time
+# and then we also have CD8 specific paths: /LYM/BC/Live/CD3+dump-/NKT/TCRgd+/CD8+/CD8_RA+ and /LYM/BC/Live/CD3+dump-/NKT/TCRgd+/CD8+/CD8_RO+
+# I think I will add different levels of depth to the gating list, so that I should just be able to loop through the list
+
+
+# For gating now, the easiest path is going to be to start at the top of the list, and subsequently add the next level of nodes to the path
+# gateList = dplyr::filter(gateList, flowJoName == "root") # Since we read in the gates in a loop like i=2:len(nodes) and indexed gates[i], we can't remove the root from the list
+
+# str split flowJoName by "/" and take the last element
+gateList$node = sapply(strsplit(gateList$flowJoName, "/"), function(x) x[length(x)])
+gateList$parent = sapply(strsplit(gateList$flowJoName, "/"), function(x) paste0(x[1:(length(x) - 1)], collapse = "/"))
+gateList$parent[gateList$parent == ""] = "root"
+
+gateList = dplyr::filter(gateList, node != "root")
+```
+
+
+```{r get gates and transformations}
+# get the controls
+samples = data.frame(flowJoName = sampleNames(gs_flowJo) )
+# remove the _95977 from exp_D_MN_B04_IC04.fcs_95977, etc
+samples$fcsName = gsub(".fcs_.*", ".fcs", samples$flowJoName)
+
+samples = merge(samples, design, by = "fcsName")
+
+
+table(samples$condition, samples$batch)
+
+```
+
+```{r generate gate and transformer lists}
+# start building out gates
+
+# IMPORTANT: the first time I ran the evaluation I had issues with the not gates. I will correctly handle them in the next section. HOWEVER - the big problem is how they are coming out of the workspace, eg. NKT in the gating paths should actually be NKT- and the gate that has filterId NKT is actually NKT+! So I am going to have to fix the gate names in the gating objects, but more importantly, we will have to replace all the NKTs in paths to NKT-. And it gets even worse TCRgd+ in the gating paths is actually TCRgd- and the gate that has filterId TCRgd+ is actually TCRgd+! So I will have to fix that as well. 
+
+gates = list()
+trans = list()
+for (condition_ in unique(design$condition)) {
+  gates[[condition_]] = list()
+  trans[[condition_]] = list()
+}
+
+for (iControl in 1:nrow(samples)) {
+  condition_ = samples$condition[iControl]
+  batch_ = samples$batch[iControl]
+  
+  #Get the gates for this condition and batch
+  gates_ = list()
+  for (i in 1:nrow(gateList)) {
+    gates_[[i]] = gs_pop_get_gate(gs_flowJo, gateList$flowJoName[i])[[iControl]]
+  }
+  gates[[condition_]][[batch_]] = gates_
+  
+  # Get transformations for this condition and batch
+  trans_ = gh_get_transformations(gs_flowJo[[iControl]])
+  trans[[condition_]][[batch_]] <- transformList(from = names(trans_), trans_)
+}
+```
+
+
+```{r explore the NKT gate}
+# The first pass of the validation, I noticed that all gates after NKT are off. So let's go find out what is going on.
+gateList$flowJoName[gateList$node == "NKT"]
+idx = which(gateList$node == "NKT")
+
+gate_ = gates[[1]][[1]][[idx]]
+gate_
+
+# Looking into 2024-04-30_Tpanel-Gating Tree.pdf it seems that NKT and TCRgd+ are both not gates.
+# I don't understand why flowJo is not storing these correctly, but I will add them to the list of nodes
+
+
+```
+
+
+
+```{r handling the not gates NKT}
+# gatesBackup = gates
+# gateListBackup = gateList
+# gates = gatesBackup
+# gateList = gateListBackup
+
+# first not gate is NKT - instead of separating these,  could write that in a loop/function
+# but since this is the first time doing this, I will do it manually
+idx = which(gateList$node == "NKT")
+gate_ = gates[[1]][[1]][[idx]]
+gate_
+
+gatesObject = gates[[1]][[1]]
+
+
+filterIdpos = "NKT+" 
+filterIdneg = "NKT-"
+
+
+parent = gateList$parent[idx]
+
+flowJoNamePos = paste(parent, filterIdpos, sep = "/")
+flowJoNameNeg = paste(parent, filterIdneg, sep = "/")
+
+# inside the gateList, replace all instances of NKT with NKT-
+# Important: we do this first so that we replace all of them for now, and then we 
+# will replace the one NKT that should be NKT+ but got turned into NKT- with flowJoNamePos
+gateList$flowJoName = gsub("NKT", "NKT-", gateList$flowJoName)
+gateList$parent = gsub("NKT", "NKT-", gateList$parent)
+
+gateList$flowJoName[idx] = flowJoNamePos
+gateList$node[idx] = filterIdpos
+
+# insert NKTgate into the gate list and the gate object
+# we have to insert after the NKT gate to make sure that when we sequentially gate it the NKT+ gate is there
+gateList = rbind(gateList[1:idx,], data.frame(flowJoName = flowJoNameNeg, node = filterIdneg, parent = parent), gateList[(idx+1):nrow(gateList),])
+
+# setup the gate that will be inserted
+filterChar = paste0("`!", filterIdpos, "`")
+filterExpression = parse(text = filterChar)[[1]]
+
+# Build the not gate
+exprs <- paste0("!", filterIdpos)
+gate_ = eval(substitute(booleanFilter(v, filterId = w), list(v = as.symbol(exprs), w = filterIdneg)))
+
+# after updating the gate list, we need to update the gates object
+for (condition_ in unique(design$condition)) {
+  for (batch_ in unique(design$batch)) {
+    # update the filter name of the gate object
+    gatesObject = gates[[condition_]][[batch_]]
+    gatesObject[[idx]]@filterId = filterIdpos
+
+    # insert the additional logical gate into the gates object
+    gatesObject = c(gatesObject[1:idx], list(gate_), gatesObject[(idx+1):length(gatesObject)])
+    
+    gates[[condition_]][[batch_]] = gatesObject
+  }
+}
+
+
+```
+
+```{r handling the not gates TCRgd}
+# gatesBackup = gates
+# gateListBackup = gateList
+# gates = gatesBackup
+# gateList = gateListBackup
+
+# first not gate is NKT - instead of separating these,  could write that in a loop/function
+# but since this is the first time doing this, I will do it manually
+idx = which(gateList$node == "TCRgd+")
+gate_ = gates[[1]][[1]][[idx]]
+gate_
+
+gatesObject = gates[[1]][[1]]
+
+
+filterIdpos = "TCRgd+" 
+filterIdneg = "TCRgd-"
+
+
+parent = gateList$parent[idx]
+
+flowJoNamePos = paste(parent, filterIdpos, sep = "/")
+flowJoNameNeg = paste(parent, filterIdneg, sep = "/")
+
+# inside the gateList, replace all instances of TCRgd+ with TCRgd-
+gateList$flowJoName = gsub("TCRgd\\+", "TCRgd-", gateList$flowJoName)
+gateList$parent = gsub("TCRgd\\+", "TCRgd-", gateList$parent)
+
+gateList$flowJoName[idx] = flowJoNamePos
+gateList$node[idx] = filterIdpos
+
+# insert TCRgd- into the gate list and the gate object
+# we have to insert after the TCRgd+ gate to make sure that when we sequentially gate it the TCRgd+ gate is there
+gateList = rbind(gateList[1:idx,], data.frame(flowJoName = flowJoNameNeg, node = filterIdneg, parent = parent), gateList[(idx+1):nrow(gateList),])
+
+# setup the gate that will be inserted
+filterChar = paste0("`!", filterIdpos, "`")
+filterExpression = parse(text = filterChar)[[1]]
+
+# Build the not gate
+exprs <- paste0("!", filterIdpos)
+gate_ = eval(substitute(booleanFilter(v, filterId = w), list(v = as.symbol(exprs), w = filterIdneg)))
+
+# after updating the gate list, we need to update the gates object
+for (condition_ in unique(design$condition)) {
+  for (batch_ in unique(design$batch)) {
+    # update the filter name of the gate object
+    gatesObject = gates[[condition_]][[batch_]]
+    gatesObject[[idx]]@filterId = filterIdpos
+
+    # insert the additional logical gate into the gates object
+    gatesObject = c(gatesObject[1:idx], list(gate_), gatesObject[(idx+1):length(gatesObject)])
+    
+    gates[[condition_]][[batch_]] = gatesObject
+  }
+}
+```
+
+```{r handling the not gates Treg}
+# gatesBackup = gates
+# gateListBackup = gateList
+# gates = gatesBackup
+# gateList = gateListBackup
+
+# first not gate is NKT - instead of separating these,  could write that in a loop/function
+# but since this is the first time doing this, I will do it manually
+idx = which(gateList$node == "Treg")
+gate_ = gates[[1]][[1]][[idx]]
+gate_
+
+gatesObject = gates[[1]][[1]]
+
+
+filterIdpos = "Treg+" 
+filterIdneg = "Treg-"
+
+
+parent = gateList$parent[idx]
+
+flowJoNamePos = paste(parent, filterIdpos, sep = "/")
+flowJoNameNeg = paste(parent, filterIdneg, sep = "/")
+
+# inside the gateList, replace all instances of the original form to the negative
+gateList$flowJoName = gsub("Treg", "Treg-", gateList$flowJoName)
+gateList$parent = gsub("Treg", "Treg-", gateList$parent)
+
+gateList$flowJoName[idx] = flowJoNamePos
+gateList$node[idx] = filterIdpos
+
+# insert TCRgd- into the gate list and the gate object
+# we have to insert after the TCRgd+ gate to make sure that when we sequentially gate it the TCRgd+ gate is there
+gateList = rbind(gateList[1:idx,], data.frame(flowJoName = flowJoNameNeg, node = filterIdneg, parent = parent), gateList[(idx+1):nrow(gateList),])
+
+# setup the gate that will be inserted
+filterChar = paste0("`!", filterIdpos, "`")
+filterExpression = parse(text = filterChar)[[1]]
+
+# Build the not gate
+exprs <- paste0("!", filterIdpos)
+gate_ = eval(substitute(booleanFilter(v, filterId = w), list(v = as.symbol(exprs), w = filterIdneg)))
+
+# after updating the gate list, we need to update the gates object
+for (condition_ in unique(design$condition)) {
+  for (batch_ in unique(design$batch)) {
+    # update the filter name of the gate object
+    gatesObject = gates[[condition_]][[batch_]]
+    gatesObject[[idx]]@filterId = filterIdpos
+
+    # insert the additional logical gate into the gates object
+    gatesObject = c(gatesObject[1:idx], list(gate_), gatesObject[(idx+1):length(gatesObject)])
+    
+    gates[[condition_]][[batch_]] = gatesObject
+  }
+}
+```
+
+```{r reset index of gate list}
+# make the rownames clean numeric again
+rownames(gateList) = NULL
+gateList$idx = 1:nrow(gateList)
+```
+
+
+### Transform fcs and setup validation gating sets
+
+
+```{r transform fcs files}
+fcs_transformed_directory = file.path(fcsDir, "transformed_flow_data", "T_cell_panel")
+
+design$transformedFcs = file.path(fcs_transformed_directory, design$fcsName)
+
+# The first time I analyze this data set, I am actually loading and transforming the data
+
+paths_ = unique(dirname(design$transformedFcs))
+for (path_ in paths_) {
+  dir.create(path_, showWarnings = F, recursive = T)
+}
+
+# Everytime we get a new gating set/workspace, we need to transform the fcs files again.
+for (iRow in 1:nrow(design)) {
+  print(iRow)
+  if (file.exists(design$transformedFcs[iRow])) {
+    next
+  }
+  ff = read.FCS(design$fcsFiles[iRow], truncate_max_range = TRUE)
+  # ff = read.FCS(design$fcs_file[iRow], truncate_max_range = FALSE)
+  ff_t = flowCore::transform(ff, trans[[design$condition[iRow]]][[design$batch[iRow]]])
+  
+  write.FCS(ff_t, file = design$transformedFcs[iRow])
+}
+
+```
+
+
+```{r read in the counts from amber}
+# This time, Amber did not get event counts for all individual files. So instead of making gating sets that contain "all" files, 
+# I can read in her count list first, and then use only samples that she used to build gating sets.
+# This way creating the gating sets will be much faster and I can still make all the comparisons needed
+
+counts_amber = read_csv("tables/T_cell_root_and_all_pars_counts_D4.csv")
+# Remember, later we will need to replace all paths of NKT with NKT- and TCRgd+ with TCRgd-, Treg with Treg- in the counts_amber data frame
+
+```
+
+```{r setup gating sets}
+# After organizing the gates, we need to organize the fcs files into gating sets
+# instead of making folders and using symboling links (cyto_setup needs a folder to read files in)
+# let's see if we can build the gs objects with flowCore (flowSet() and GatingSet() )
+
+gs = list()
+for (condition_ in unique(design$condition)) {
+  gs[[condition_]] = list()
+}
+
+for (condition_ in unique(design$condition)) {
+  for (batch_ in unique(design$batch)) {
+    samples_ = dplyr::filter(design, condition == condition_, batch == batch_)
+    # add a second filtering step to only keep files that amber tested on
+    samples_ = dplyr::filter(samples_, fcsName %in% counts_amber$sample)
+    
+    
+    print(paste0("group: ", condition_, " batch: ", batch_, " samples: ", nrow(samples_)))
+    flowSet = read.flowSet(samples_$transformedFcs,
+                           truncate_max_range = FALSE)
+    
+    gs[[condition_]][[batch_]] = GatingSet(flowSet)
+  }
+}
+```
+
+### Do gating
+
+```{r gate all the gates amber gave us}
+# this is a bit different than in previous iterations - now, instead of going by "hierarchical" and 
+# "leafs" I am going to just step through sequentially
+
+for (condition_ in unique(design$condition)) {
+  for (batch_ in unique(design$batch)) {
+    for (i in 1:nrow(gateList) ) {
+      gs_pop_add(gs[[condition_]][[batch_]], gates[[condition_]][[batch_]][[i]], parent = gateList$parent[i])
+    }
+  }
+}
+
+```
+
+```{r summarize event counts}
+pop_counts = c()
+
+for (condition_ in unique(design$condition)) {
+  for (batch_ in unique(design$batch)) {
+    recompute(gs[[condition_]][[batch_]])
+    
+    pop_counts = rbind(pop_counts, 
+                       gs_pop_get_count_fast(gs[[condition_]][[batch_]], format = "long")
+                       )
+  }
+}
+
+save(pop_counts, file = "data/Tcell_pop_counts_root_and_all_pars_gating.Rdata")
+```
+
+
+### Validation with FlowJO counts
+```{r compare the results to Ambers counts}
+
+
+merged_pop_counts_ = dplyr::select(pop_counts, fcsName = name, population = Population, countR = Count)
+
+counts_amber_long = counts_amber %>% 
+  pivot_longer(-sample, names_to = "population", values_to = "count_amber")
+
+counts_amber_long = dplyr::select(counts_amber_long, fcsName = sample, population, countAmber = count_amber )
+
+# ambers counts are missing the leading /
+symdiff(counts_amber_long$population, merged_pop_counts_$population, )
+
+counts_amber_long$population = paste0("/", counts_amber_long$population)
+
+# now we should only have "/Count" missing. this would be equal to our "root"
+# and also the PB+ gate (which Amber did not write out)
+symdiff(counts_amber_long$population, merged_pop_counts_$population)
+
+# lots still missing - remember, we need to replace NKT and TCRgd+
+counts_amber_long$population = gsub("NKT", "NKT-", counts_amber_long$population)
+counts_amber_long$population = gsub("TCRgd\\+", "TCRgd-", counts_amber_long$population)
+counts_amber_long$population = gsub("Treg", "Treg-", counts_amber_long$population)
+
+symdiff(counts_amber_long$population, merged_pop_counts_$population)
+# Now we are only missing the NKT+ and TCRgd+ gates and the /LYM/BC/Live/CD3+dump-/NKT-/TCRgd-/CD4+/CXCR3_dim+ gate that I think shouldn't be in the flowJo workspace
+
+merged_pop_counts = left_join(merged_pop_counts_, counts_amber_long, by = c("fcsName", "population"))
+
+# removing amber counts with NA, will remove the PB+ nodes
+merged_pop_counts = dplyr::filter(merged_pop_counts, !is.na(countAmber))
+
+```
+
+```{r visualize results}
+ggplot(merged_pop_counts, aes(x = countR, y = countAmber, color = fcsName)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey") +
+  facet_wrap(~population, scales = "free") +
+  theme_bw() +
+  # reduce fontsize
+  theme(text = element_text(size = 6)) +
+  labs(x = "counts Stephan", y = "counts Amber") + 
+  # dont show legend
+  theme(legend.position = "none")
+
+# The first pass, I noticed that all gates after NKT are off. So let's go find out what is going on.
+
+
+ggsave("plots/Tcells/validation/hierarchical_and_all_pars.pdf", width = 25, height = 15, units = "in")
+ggsave("plots/Tcells/validation/hierarchical_and_all_pars.png", width = 25, height = 15, units = "in")
+```
+
+## IMPACD gating
+
+```{r set up functions to keep code cleaner}
+
+# setup gating set
+getGatingSet = function(design) {
+  gs = list()
+  for (condition_ in unique(design$condition)) {
+    gs[[condition_]] = list()
+  }
+  
+  for (condition_ in unique(design$condition)) {
+    for (batch_ in unique(design$batch)) {
+      samples_ = dplyr::filter(design, condition == condition_, batch == batch_)
+      
+      print(paste0("group: ", condition_, " batch: ", batch_, " samples: ", nrow(samples_)))
+      flowSet = read.flowSet(samples_$transformedFcs,
+                             truncate_max_range = FALSE)
+      
+      gs[[condition_]][[batch_]] = GatingSet(flowSet)
+    }
+  }
+  
+  return(gs)
+}
+
+# gate for the rootpath - rootPathGates must be in the same order that you want the rootpath to be in
+getRootPathTcells = function(gs, design, gates, rootPathGates) {
+  
+  for (condition_ in unique(design$condition)) {
+    for (batch_ in unique(design$batch)) {
+      for (i in 1:nrow(rootPathGates) ) {
+        gs_pop_add(gs[[condition_]][[batch_]], gates[[condition_]][[batch_]][[rootPathGates$idx[i]]], parent = rootPathGates$parent[i])
+      }
+    }
+  }
+  
+  return(gs)
+}
+
+# level1 gating
+gateLevel1 = function(gs, design, level1_gates, level1_nodes, gatemetadata, root_path) {
+  # do the stage 1 gating
+  for (condition_ in unique(design$condition)) {
+    for (batch_ in unique(design$batch)) {
+      message(paste0("Stage 1 gating for batch ", batch_, " in group ", condition_))
+      level1_paths = level1Gating(gs[[condition_]][[batch_]], 
+                                  level1_nodes, 
+                                  gatemetadata, level1_gates[[condition_]][[batch_]], 
+                                  root_path) 
+    }
+  }
+  
+  return(gs)
+}
+
+# permutational gating
+gateIMPACD = function(gs, design, level1_gates, level1_nodes, gatemetadata, root_path) {
+  population_counts = list()
+  for (condition_ in unique(design$condition)) {
+    # population_counts[[condition_]] = list()
+    
+    for (batch_ in unique(design$batch)) {
+      message(paste0("Stage 2 gating for batch ", batch_, " in group ", condition_))
+      level2_paths = level2Gating(gs[[condition_]][[batch_]], 
+                                  level1_nodes, gatemetadata, level1_gates[[condition_]][[batch_]], 
+                                  root_path,
+                                  max_depth = 3,
+                                  level1_nodes = level1_nodes,
+                                  cellcountCutoff = 0) 
+      
+      # pop_counts_ = gs_pop_get_count_fast(gs[[condition_]][[batch_]], format = "long")
+      # population_counts[[condition_]][[batch_]] = pop_counts_
+    }
+  }
+  
+  return(gs)
+}
+
+getRawCounts = function(gs, design) {
+  population_counts = list()
+  for (condition_ in unique(design$condition)) {
+    population_counts[[condition_]] = list()
+    for (batch_ in unique(design$batch)) {
+      pop_counts_ = gs_pop_get_count_fast(gs[[condition_]][[batch_]], format = "long")
+      population_counts[[condition_]][[batch_]] = pop_counts_
+    }
+  }
+  
+  counts = c()
+  for (condition_ in unique(design$condition)) {
+    counts_ = bind_rows(population_counts[[condition_]])
+    counts_$condition = condition_
+    counts = rbind(counts, counts_)
+  }
+  counts$PercentParent = counts$Count/counts$ParentCount*100
+  counts$PercentParent[is.na(counts$PercentParent)] = NA
+
+  return(counts)
+}
+
+processGatingPaths = function(summary, max_depth = 1) {
+
+  columns = colnames(summary)
+
+  if (!"path" %in% columns) {
+    summary$path = summary$Population
+  }
+
+  # determine gating depth for each population
+  summary$depth = str_count(summary$path, "/")
+
+  # determine gating depth of the root path
+  root_path_length = max(summary$depth)-max_depth
+
+  # split all gating paths into a matrix so that gating results can be more
+  # easily extracted later
+  pathing = str_split(str_remove(summary$path, '^/'), "/", simplify = TRUE)
+
+  # determine the root path
+  # root_path = paste(pathing[nrow(summary), 1:root_path_length], collapse = "/")
+  # summary$root_node = root_path
+
+  # determine terminal node
+  summary$terminal_node = pathing[cbind(1:nrow(pathing), summary$depth)]
+
+  # determine gating depth after root path
+  summary$depth = summary$depth - root_path_length
+
+  # No need to extract modifiers if max_depth is 1
+  if (max_depth == 1) {return(summary)}
+
+  # determine what the maximum number of modifiers must have been
+  max_modifiers = max_depth -1
+
+  # determine all modifiers and add columns for them, will generate columns of
+  # the type modifier_1, modifier_2, ... up to the maximum number of modifiers
+  for (i_modifier in 1:max_modifiers ){
+    column_name = paste0("modifier", "_", i_modifier)
+
+    summary[[column_name]] = ""
+
+    idx = which(summary$depth>i_modifier)
+
+    summary[idx, column_name] = pathing[cbind(idx, root_path_length+i_modifier)]
+  }
+
+  return(summary)
+}
+
+assignRoot = function(nodes, rootPaths) {
+  # Escape both + and - signs in rootPaths
+  escaped_rootPaths <- sapply(rootPaths, function(path) {
+      path <- str_replace_all(path, "\\+", "\\\\+")  # Escape +
+      path <- str_replace_all(path, "\\-", "\\\\-")  # Escape -
+      return(path)
+    })
+  
+  # Create a new column in counts
+  nodes <- nodes %>%
+    rowwise() %>%  # rowwise to evaluate for each row
+    mutate(
+      rootPath = {
+        match <- sapply(names(escaped_rootPaths), function(x) {
+          # Match complete paths (followed by a '/' or end of string '$')
+          str_detect(path, paste0(escaped_rootPaths[[x]], "(/|$)"))
+        })
+        if(any(match)) {
+          names(escaped_rootPaths)[which(match)[1]]  # Return the first match's name from rootPaths
+        } else {
+          NA  # No match found
+        }
+      },
+      # Remove the rootPath portion from Population to get pathInCompartment
+      pathInCompartment = ifelse(!is.na(rootPath), 
+                                 str_remove(path, paste0(escaped_rootPaths[rootPath], "(/|$)")), 
+                                 NA)
+    ) %>%
+    ungroup()  # undo rowwise
+  
+  return (nodes)
+  
+} 
+
+
+convertToMatrix = function(counts, depths = c(1, 2, 3)) {
+  counts = dplyr::filter(counts, depth %in% depths)
+  
+  pctParent =     spread(dplyr::select(counts, sampleName, PercentParent, subset), key = sampleName, value = PercentParent)
+  parentCounts =  spread(dplyr::select(counts, sampleName, ParentCount,   subset), key = sampleName, value = ParentCount)
+  popCounts =     spread(dplyr::select(counts, sampleName, Count,         subset), key = sampleName, value = Count)
+  
+  rownames(pctParent) = pctParent$subset
+  rownames(parentCounts) = parentCounts$subset
+  rownames(popCounts) = popCounts$subset
+  
+  pctParent = dplyr::select(pctParent, -subset)
+  parentCounts = dplyr::select(parentCounts, -subset)
+  popCounts = dplyr::select(popCounts, -subset)
+  
+  return(list(pctParent = pctParent, parentCounts = parentCounts, popCounts = popCounts))
+}
+
+```
+
+```{r setup leafnodes}
+
+leaf_nodes = gateList[50:66, ]
+
+level1_nodes = leaf_nodes$node
+
+# create the list object with batch/sampletype specific gates that we can feed to IMPACD for the permutational gating
+level1_gates = list()
+for (condition_ in unique(design$condition)) {
+  level1_gates[[condition_]] = list()
+  
+  for (batch_ in unique(design$batch)) {
+    level1_gates[[condition_]][[batch_]] = gates[[condition_]][[batch_]][leaf_nodes$idx]
+    names(level1_gates[[condition_]][[batch_]]) = level1_nodes
+  }
+}
+
+
+# Besides the list of gates, we also need a gate "metadata frame". Below is the example from
+# the IMPACD documentation. Since we aren't going to use the metadata for building the gates,
+# we can make most columns NAs, we will just need the logical "gate" column, which, fortunately for us
+# is going to be all FALSE, since the only logical gate (PB) is part of the root path 
+# and was handled outside of IMPACD
+# head(gate_data)
+# name gate_type marker1 marker2 original_gate_position logical_gate transformed_gate_position
+# 1 CD49b+        1D Dy161Di             76.400000000000006        FALSE              c(138.34....
+# 2 CD49b-        1D Dy161Di             76.400000000000006        FALSE              c(138.34....
+gatemetadata = data.frame(name = level1_nodes, 
+                          gate_type = "2D", 
+                          marker1 = NA, 
+                          marker2 = NA, 
+                          original_gate_position = NA, 
+                          logical_gate = FALSE, 
+                          transformed_gate_position = NA)
+
+```
+
+### Global CD4+ Tcell gating
+
+```{r root path for global CD4s}
+gateList$flowJoName[1:14]
+
+# rootpath
+rootPathGates = gateList[c(1:11,13,14),]
+
+rootPaths = c()
+
+```
+
+#### AIM+: LYM/BC/Live/CD3+dump-/NKT-/TCRgd-/CD4+/Treg-/AIM+
+
+After validation of the gates, we can now kick off IMPACD!
+```{r set up clean gating sets again}
+gs = getGatingSet(design)
+```
+
+```{r gate the root path}
+# LYM/BC/Live/CD3+dump-/NKT/TCRgd/CD4+/AIM+
+
+# add the AIM+ node, and also update the parent since we are leaving out the Treg gate
+rootPathGates = rbind(rootPathGates, dplyr::filter(gateList, node == "CD4_AIM+"))
+rootPathGates$flowJoName[nrow(rootPathGates)] = paste(rootPathGates$flowJoName[nrow(rootPathGates) - 1], rootPathGates$node[nrow(rootPathGates)], sep = "/")
+rootPathGates$parent[nrow(rootPathGates)] = rootPathGates$flowJoName[nrow(rootPathGates) - 1]
+
+gs = getRootPathTcells(gs, design, gates, rootPathGates)
+
+```
+
+
+```{r gate}
+root_path = rootPathGates$flowJoName[nrow(rootPathGates)]
+
+rootPaths["global_CD4_AIM+"] = root_path
+
+print(root_path)
+
+gs = gateLevel1(gs, design, level1_gates, level1_nodes, gatemetadata, root_path)
+
+gs = gateIMPACD(gs, design, level1_gates, level1_nodes, gatemetadata, root_path)
+```
+
+#### AIM++: LYM/BC/Live/CD3+dump-/NKT-/TCRgd-/CD4+/Treg-/AIM++
+```{r gate the root path}
+# Add the AIM++ gate
+
+rootPathGates = dplyr::filter(gateList, node %in% c("CD4_AIM++") )
+rootPathGates$parent[1] = dplyr::filter(gateList, node == "Treg-")$flowJoName[1]
+
+# add just the AIM++ node
+for (condition_ in unique(design$condition)) {
+  for (batch_ in unique(design$batch)) {
+      gs_pop_add(gs[[condition_]][[batch_]], gates[[condition_]][[batch_]][[rootPathGates$idx[1]]], parent = rootPathGates$parent[1])
+  }
+}
+
+# Root path for subsequent gating
+root_path = paste(rootPathGates$parent[1], rootPathGates$node[1], sep = "/")
+
+rootPaths["global_CD4_AIM++"] = root_path
+
+print(root_path)
+```
+
+```{r gate}
+gs = gateLevel1(gs, design, level1_gates, level1_nodes, gatemetadata, root_path)
+
+gs = gateIMPACD(gs, design, level1_gates, level1_nodes, gatemetadata, root_path)
+```
+
+#### Process counts
+```{r summarize counts and save}
+counts = getRawCounts(gs, design)
+
+# write counts to an Rdata file
+save(counts, file = file.path(rawCountsDir, "CD4_AIM+_AIM++.Rdata"))
+```
+
+```{r process paths}
+
+# combine with design
+counts = merge(dplyr::select(counts, -condition), design, by.x = "name", by.y = "fcsName")
+# rename column name to fcsName
+colnames(counts)[colnames(counts) == "name"] = "fcsName"
+counts = dplyr::filter(counts, control == FALSE)
+
+# extract the populations
+nodes = data.frame(path = unique(counts$Population))
+nodes = processGatingPaths(nodes, max_depth = 3)
+
+
+nodes = assignRoot(nodes, rootPaths)
+
+nodes$compartment = ifelse(str_detect(nodes$path, "AIM"), "antigen_specific", "global") 
+
+nodes$subset = paste("CD4", nodes$rootPath, nodes$pathInCompartment, sep = "/")
+nodes$subset[is.na(nodes$rootPath)] = NA
+nodes$compartment[is.na(nodes$rootPath)] = NA
+
+counts = merge(counts, nodes, by.x = "Population", by.y = "path")
+
+```
+
+
+```{r turn into matrices}
+
+matrices = convertToMatrix(counts, depths = c(1, 2, 3))
+
+# save matrices
+save(matrices, nodes, file = file.path(processedCountsDir, "CD4_AIM+_AIM++.Rdata"))
+
+```
+
+### CD45RO+ cells
+
+```{r set up clean gating sets again}
+gs = getGatingSet(design)
+```
+
+#### CD45RO+: LYM/BC/Live/CD3+dump-/NKT-/TCRgd-/CD4+/Treg-/CD45RO+
+
+```{r root path for global CD4s}
+gateList$flowJoName[1:14]
+
+# rootpath
+rootPathGates = rbind(gateList[c(1:11,13,14),], dplyr::filter(gateList, node %in% c("CD4_RO+") ) )
+
+```
+
+```{r gate the root path}
+gs = getRootPathTcells(gs, design, gates, rootPathGates)
+
+```
+
+```{r run IMPACD for level 1}
+root_path = rootPathGates$flowJoName[nrow(rootPathGates)]
+
+rootPaths["CD4RO+"] = root_path
+
+gs = gateLevel1(gs, design, level1_gates, level1_nodes, gatemetadata, root_path)
+```
+
+```{r run full IMPACD on first root path}
+gs = gateIMPACD(gs, design, level1_gates, level1_nodes, gatemetadata, root_path)
+```
+
+#### AIM+: LYM/BC/Live/CD3+dump-/NKT-/TCRgd-/CD4+/Treg-/CD45RO+/AIM+
+
+```{r gate the root path}
+# We ended up using the AIM++ gate for deciding on antigen specificity, hence AIM+ is commented out
+
+
+# Add the AIM+ gate
+# AIMp_gate = dplyr::filter(gateList, node %in% c("CD4_AIM+") )
+# 
+# # add just the AIM++ node
+# for (condition_ in unique(design$condition)) {
+#   for (batch_ in unique(design$batch)) {
+#       gs_pop_add(gs[[condition_]][[batch_]], gates[[condition_]][[batch_]][[AIMp_gate$idx]], parent = rootPaths["CD4RO+"])
+#   }
+# }
+# 
+# # Root path for subsequent gating
+# root_path = paste(rootPaths["CD4RO+"], AIMp_gate$node, sep = "/")
+# 
+# rootPaths["CD4RO+_AIM+"] = root_path
+# 
+# print(root_path)
+```
+
+```{r run level 1 and IMPACD}
+# gs = gateLevel1(gs, design, level1_gates, level1_nodes, gatemetadata, root_path)
+
+# gs = gateIMPACD(gs, design, level1_gates, level1_nodes, gatemetadata, root_path)
+```
+
+#### AIM++: LYM/BC/Live/CD3+dump-/NKT-/TCRgd-/CD4+/Treg-/CD45RO+/AIM++
+```{r gate the root path}
+# Add the AIM+ gate
+AIMpp_gate = dplyr::filter(gateList, node %in% c("CD4_AIM++") )
+
+# add just the AIM++ node
+for (condition_ in unique(design$condition)) {
+  for (batch_ in unique(design$batch)) {
+      gs_pop_add(gs[[condition_]][[batch_]], gates[[condition_]][[batch_]][[AIMpp_gate$idx]], parent = rootPaths["CD4RO+"])
+  }
+}
+
+# Root path for subsequent gating
+root_path = paste(rootPaths["CD4RO+"], AIMpp_gate$node, sep = "/")
+
+rootPaths["CD4RO+_AIM++"] = root_path
+
+print(root_path)
+
+
+```
+
+```{r run IMPACD for level 1}
+gs = gateLevel1(gs, design, level1_gates, level1_nodes, gatemetadata, root_path)
+```
+
+```{r run full IMPACD on first root path}
+gs = gateIMPACD(gs, design, level1_gates, level1_nodes, gatemetadata, root_path)
+```
+
+#### Process counts 
+```{r summarize counts and save}
+counts = getRawCounts(gs, design)
+
+countsOrig = counts
+
+# write counts to an Rdata file
+save(counts, file = file.path(rawCountsDir, "CD4RO+.Rdata"))
+```
+
+```{r process paths}
+
+# combine with design
+counts = merge(dplyr::select(counts, -condition), design, by.x = "name", by.y = "fcsName")
+# rename column name to fcsName
+colnames(counts)[colnames(counts) == "name"] = "fcsName"
+counts = dplyr::filter(counts, control == FALSE)
+
+# extract the populations
+nodes = data.frame(path = unique(counts$Population))
+nodes$compartment = ifelse(str_detect(nodes$path, "AIM"), "antigen_specific", "global") 
+
+# split if up into antigen specific ones and global ones
+nodes_ = dplyr::filter(nodes, compartment == "antigen_specific")
+nodes = dplyr::filter(nodes, compartment != "antigen_specific")
+
+nodes = processGatingPaths(nodes, max_depth = 3)
+nodes_ = processGatingPaths(nodes_, max_depth = 3)
+
+names(rootPaths)
+
+nodes = assignRoot(nodes, rootPaths["CD4RO+"])
+nodes_ = assignRoot(nodes_, rootPaths[c("CD4RO+_AIM+", "CD4RO+_AIM++")])
+# We ended up using only the AIM++ gate for antigen specificity, hence I am going to remove any AIM+ nodes here
+# Note, the counts for AIM+ are still in the original raw data
+nodes_ = dplyr::filter(nodes_, rootPath != "CD4RO+_AIM+")
+
+nodes = rbind(nodes, nodes_)
+
+nodes$subset = paste("CD4RO+", nodes$compartment, nodes$pathInCompartment, sep = "/")
+# remove trailing / from subset
+nodes$subset = str_remove(nodes$subset, "/$")
+
+nodes$subset[is.na(nodes$rootPath)] = NA
+nodes$compartment[is.na(nodes$rootPath)] = NA
+
+
+counts = merge(counts, nodes, by.x = "Population", by.y = "path")
+# this is also going to remove all of the AIM+ nodes that we didn't use
+
+```
+
+
+```{r turn into matrices}
+
+matrices = convertToMatrix(counts, depths = c(0, 1, 2, 3))
+
+matrices[["nodes"]] = nodes
+matrices[["design"]] = design
+
+# save matrices
+save(matrices, file = file.path(processedCountsDir, "CD4RO+.Rdata"))
+
+```
+
+### TFH cells
+
+```{r root path for global THFs}
+gateList$flowJoName[1:14]
+
+# rootpath
+rootPathGates = rbind(gateList[c(1:11,13,14),], dplyr::filter(gateList, node %in% c("CD4_RO+") )) # root path for the CD4+ RO+ cells
+
+# now add the THF node
+rootPathGates = rbind(rootPathGates, dplyr::filter(gateList, node %in% c("CXCR5+") ) )
+
+rootPathGates$parent[nrow(rootPathGates)] = rootPathGates$flowJoName[nrow(rootPathGates)-1]
+rootPathGates$flowJoName[nrow(rootPathGates)] = paste0(rootPathGates$flowJoName[nrow(rootPathGates)-1], "/", rootPathGates$node[nrow(rootPathGates)])
+
+print(rootPathGates)
+
+rootPaths["TFH"] = rootPathGates$flowJoName[nrow(rootPathGates)]
+rootPaths["TFH_AIM++"] = paste0(rootPaths["TFH"], "/", AIMpp_gate$node)
+
+# remove the CXCR5+ from markers to gate for
+nodes_to_gate = level1_nodes[level1_nodes != "CXCR5+"]
+
+```
+
+```{r set up clean gating sets again}
+gs = getGatingSet(design)
+```
+
+#### global compartment
+
+```{r gate the root path}
+gs = getRootPathTcells(gs, design, gates, rootPathGates)
+```
+
+```{r run IMPACD for globa TFH}
+root_path = rootPaths["TFH"]
+
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### antigen specific compartment
+
+```{r gate the root path}
+# Add the AIM+ gate
+AIMpp_gate = dplyr::filter(gateList, node %in% c("CD4_AIM++") )
+
+# add just the AIM++ node
+for (condition_ in unique(design$condition)) {
+  for (batch_ in unique(design$batch)) {
+      gs_pop_add(gs[[condition_]][[batch_]], gates[[condition_]][[batch_]][[AIMpp_gate$idx]], parent = root_path)
+  }
+}
+
+root_path = rootPaths["TFH_AIM++"]
+
+print(root_path)
+```
+
+```{r run IMPACD}
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### Process counts 
+```{r summarize counts and save}
+counts = getRawCounts(gs, design)
+
+
+# write counts to an Rdata file
+save(counts, file = file.path(rawCountsDir, "TFH.Rdata"))
+```
+
+```{r process paths}
+
+# combine with design
+counts = merge(dplyr::select(counts, -condition), design, by.x = "name", by.y = "fcsName")
+# rename column name to fcsName
+colnames(counts)[colnames(counts) == "name"] = "fcsName"
+counts = dplyr::filter(counts, control == FALSE)
+
+# extract the populations
+nodes = data.frame(path = unique(counts$Population))
+nodes$compartment = ifelse(str_detect(nodes$path, "AIM"), "antigen_specific", "global") 
+
+table(nodes$compartment)
+
+
+# split if up into antigen specific ones and global ones
+nodes_ = dplyr::filter(nodes, compartment == "antigen_specific")
+nodes = dplyr::filter(nodes, compartment != "antigen_specific")
+
+nodes = processGatingPaths(nodes, max_depth = 3)
+nodes_ = processGatingPaths(nodes_, max_depth = 3)
+
+names(rootPaths)
+
+nodes = assignRoot(nodes, rootPaths["TFH"])
+nodes_ = assignRoot(nodes_, rootPaths[c("TFH_AIM++")])
+
+nodes = rbind(nodes, nodes_)
+
+nodes$subset = paste("TFH", nodes$compartment, nodes$pathInCompartment, sep = "/")
+# remove trailing / from subset
+nodes$subset = str_remove(nodes$subset, "/$")
+
+nodes$subset[is.na(nodes$rootPath)] = NA
+nodes$compartment[is.na(nodes$rootPath)] = NA
+
+
+counts = merge(counts, nodes, by.x = "Population", by.y = "path")
+# this is also going to remove all of the AIM+ nodes that we didn't use
+
+```
+
+
+```{r turn into matrices}
+
+matrices = convertToMatrix(counts, depths = c(0, 1, 2, 3))
+
+matrices[["nodes"]] = nodes
+matrices[["design"]] = design
+
+# save matrices
+save(matrices, file = file.path(processedCountsDir, "TFH.Rdata"))
+
+```
+
+### non-TFH cells
+
+```{r root path for global THFs}
+
+# First, we need to add the CXCR5- gate to our data structures
+nodesToAdd = c("CXCR5")
+
+filterIdpos = paste0(nodesToAdd, "+")
+filterIdneg = paste0(nodesToAdd, "-")
+
+idx = which(gateList$node %in% filterIdpos)
+
+parent = gateList$parent[idx]
+
+flowJoNamePos = paste(parent, filterIdpos, sep = "/")
+flowJoNameNeg = paste(parent, filterIdneg, sep = "/")
+
+# setup the gate that will be inserted
+filterChar = paste0("`!", filterIdpos, "`")
+
+for (i in 1:length(nodesToAdd)) {
+  
+  exprs = paste0("!", filterIdpos[i])
+  gate_ = eval(substitute(booleanFilter(v, filterId = w), list(v = as.symbol(exprs), w = filterIdneg[i])))
+  
+  gateList = rbind(gateList, data.frame(flowJoName = flowJoNameNeg[i], node = filterIdneg[i], parent = parent[i], idx = nrow(gateList)+1 ))
+  
+  for (condition_ in unique(design$condition)) {
+    for (batch_ in unique(design$batch)) {
+      gates[[condition_]][[batch_]] = c(gates[[condition_]][[batch_]], gate_)
+    }
+  }
+  
+}
+
+
+
+gateList$flowJoName[1:14]
+
+# rootpath
+rootPathGates = rbind(gateList[c(1:11,13,14),], dplyr::filter(gateList, node %in% c("CD4_RO+") )) # root path for the CD4+ RO+ cells
+
+# now add the THF node
+rootPathGates = rbind(rootPathGates, dplyr::filter(gateList, node %in% c("CXCR5+", "CXCR5-")) )
+
+rootPathGates$parent[(nrow(rootPathGates)-1):nrow(rootPathGates)] = rootPathGates$flowJoName[rootPathGates$node == "CD4_RO+"]
+rootPathGates$flowJoName[(nrow(rootPathGates)-1):nrow(rootPathGates)] = paste0(rootPathGates$parent[(nrow(rootPathGates)-1):nrow(rootPathGates)], "/", rootPathGates$node[(nrow(rootPathGates)-1):nrow(rootPathGates)])
+
+
+
+print(rootPathGates)
+
+rootPaths["non-TFH"] = rootPathGates$flowJoName[nrow(rootPathGates)]
+rootPaths["non-TFH_AIM++"] = paste0(rootPaths["non-TFH"], "/", AIMpp_gate$node)
+
+# remove the CXCR5+ from markers to gate for
+nodes_to_gate = level1_nodes[level1_nodes != "CXCR5+"]
+
+```
+
+```{r set up clean gating sets again}
+gs = getGatingSet(design)
+```
+
+#### global compartment
+
+```{r gate the root path}
+gs = getRootPathTcells(gs, design, gates, rootPathGates)
+```
+
+```{r run IMPACD for globa TFH}
+root_path = rootPaths["non-TFH"]
+
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### antigen specific compartment
+
+```{r gate the root path}
+# Add the AIM+ gate
+AIMpp_gate = dplyr::filter(gateList, node %in% c("CD4_AIM++") )
+
+# add just the AIM++ node
+for (condition_ in unique(design$condition)) {
+  for (batch_ in unique(design$batch)) {
+      gs_pop_add(gs[[condition_]][[batch_]], gates[[condition_]][[batch_]][[AIMpp_gate$idx]], parent = root_path)
+  }
+}
+
+root_path = rootPaths["non-TFH_AIM++"]
+
+print(root_path)
+```
+
+```{r run IMPACD}
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### Process counts 
+```{r summarize counts and save}
+counts = getRawCounts(gs, design)
+
+
+# write counts to an Rdata file
+save(counts, file = file.path(rawCountsDir, "non-TFH.Rdata"))
+```
+
+```{r process paths}
+
+# combine with design
+counts = merge(dplyr::select(counts, -condition), design, by.x = "name", by.y = "fcsName")
+# rename column name to fcsName
+colnames(counts)[colnames(counts) == "name"] = "fcsName"
+counts = dplyr::filter(counts, control == FALSE)
+
+# extract the populations
+nodes = data.frame(path = unique(counts$Population))
+nodes$compartment = ifelse(str_detect(nodes$path, "AIM"), "antigen_specific", "global") 
+
+table(nodes$compartment)
+
+
+# split if up into antigen specific ones and global ones
+nodes_ = dplyr::filter(nodes, compartment == "antigen_specific")
+nodes = dplyr::filter(nodes, compartment != "antigen_specific")
+
+nodes = processGatingPaths(nodes, max_depth = 3)
+nodes_ = processGatingPaths(nodes_, max_depth = 3)
+
+names(rootPaths)
+
+nodes = assignRoot(nodes, rootPaths["non-TFH"])
+nodes_ = assignRoot(nodes_, rootPaths[c("non-TFH_AIM++")])
+
+nodes = rbind(nodes, nodes_)
+
+nodes$subset = paste("non-TFH", nodes$compartment, nodes$pathInCompartment, sep = "/")
+# remove trailing / from subset
+nodes$subset = str_remove(nodes$subset, "/$")
+
+nodes$subset[is.na(nodes$rootPath)] = NA
+nodes$compartment[is.na(nodes$rootPath)] = NA
+
+
+counts = merge(counts, nodes, by.x = "Population", by.y = "path")
+# this is also going to remove all of the AIM+ nodes that we didn't use
+
+```
+
+
+```{r turn into matrices}
+
+
+matrices = convertToMatrix(dplyr::filter(counts, !is.na(subset)), depths = c(0, 1, 2, 3))
+
+matrices[["nodes"]] = nodes
+matrices[["design"]] = design
+
+# save matrices
+save(matrices, file = file.path(processedCountsDir, "non-TFH.Rdata"))
+
+```
+
+### TFH Th1_17 cells
+
+```{r root path for global THFs}
+gateList$flowJoName[1:14]
+
+# rootpath
+rootPathGates = rbind(gateList[c(1:11,13,14),], dplyr::filter(gateList, node %in% c("CD4_RO+") )) # root path for the CD4+ RO+ cells
+
+# now add the THF Th1_17 node
+newNodes = c("CXCR5+", "CXCR3+", "CCR6+")
+rootPathGates = rbind(rootPathGates, gateList[match(newNodes, gateList$node), ])
+
+for (i in length(newNodes):1) {
+  idx = i - 1
+  rootPathGates$parent[nrow(rootPathGates)-idx] = rootPathGates$flowJoName[nrow(rootPathGates)-i]
+rootPathGates$flowJoName[nrow(rootPathGates)-idx] = paste0(rootPathGates$flowJoName[nrow(rootPathGates)-i], "/", rootPathGates$node[nrow(rootPathGates)-idx])
+}
+
+
+
+print(rootPathGates)
+
+subsetName = "TFH_Th1_17"
+subsetNameAntigenSpecific = "TFH_Th1_17_AIM++"
+dataFileName = paste(subsetName, "Rdata", sep = ".")
+
+rootPaths[subsetName] = rootPathGates$flowJoName[nrow(rootPathGates)]
+rootPaths[subsetNameAntigenSpecific] = paste0(rootPaths[subsetName], "/", AIMpp_gate$node)
+
+# remove markers to gate for
+nodes_to_gate = level1_nodes[!(level1_nodes %in% newNodes)]
+nodes_to_gate = nodes_to_gate[nodes_to_gate != "CXCR3_dim+"]
+
+print(nodes_to_gate)
+```
+
+
+```{r set up clean gating sets again}
+gs = getGatingSet(design)
+```
+
+#### global compartment
+
+```{r gate the root path}
+gs = getRootPathTcells(gs, design, gates, rootPathGates)
+```
+
+```{r run IMPACD for globa TFH}
+root_path = rootPaths[subsetName]
+
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### antigen specific compartment
+
+```{r gate the root path}
+# Add the AIM+ gate
+AIMpp_gate = dplyr::filter(gateList, node %in% c("CD4_AIM++") )
+
+# add just the AIM++ node
+for (condition_ in unique(design$condition)) {
+  for (batch_ in unique(design$batch)) {
+      gs_pop_add(gs[[condition_]][[batch_]], gates[[condition_]][[batch_]][[AIMpp_gate$idx]], parent = root_path)
+  }
+}
+
+root_path = rootPaths[subsetNameAntigenSpecific]
+
+print(root_path)
+```
+
+```{r run IMPACD}
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### Process counts 
+```{r summarize counts and save}
+counts = getRawCounts(gs, design)
+
+
+# write counts to an Rdata file
+save(counts, file = file.path(rawCountsDir, dataFileName))
+```
+
+```{r process paths}
+
+# combine with design
+counts = merge(dplyr::select(counts, -condition), design, by.x = "name", by.y = "fcsName")
+# rename column name to fcsName
+colnames(counts)[colnames(counts) == "name"] = "fcsName"
+counts = dplyr::filter(counts, control == FALSE)
+
+# extract the populations
+nodes = data.frame(path = unique(counts$Population))
+nodes$compartment = ifelse(str_detect(nodes$path, "AIM"), "antigen_specific", "global") 
+
+table(nodes$compartment)
+
+
+# split if up into antigen specific ones and global ones
+nodes_ = dplyr::filter(nodes, compartment == "antigen_specific")
+nodes = dplyr::filter(nodes, compartment != "antigen_specific")
+
+nodes = processGatingPaths(nodes, max_depth = 3)
+nodes_ = processGatingPaths(nodes_, max_depth = 3)
+
+names(rootPaths)
+
+nodes = assignRoot(nodes, rootPaths[subsetName])
+nodes_ = assignRoot(nodes_, rootPaths[subsetNameAntigenSpecific])
+
+nodes = rbind(nodes, nodes_)
+
+nodes$subset = paste(subsetName, nodes$compartment, nodes$pathInCompartment, sep = "/")
+# remove trailing / from subset
+nodes$subset = str_remove(nodes$subset, "/$")
+
+nodes$subset[is.na(nodes$rootPath)] = NA
+nodes$compartment[is.na(nodes$rootPath)] = NA
+
+
+counts = merge(counts, nodes, by.x = "Population", by.y = "path")
+# this is also going to remove all of the AIM+ nodes that we didn't use
+
+```
+
+
+```{r turn into matrices}
+
+matrices = convertToMatrix(counts, depths = c(0, 1, 2, 3))
+
+matrices[["nodes"]] = nodes
+matrices[["design"]] = design
+
+# save matrices
+save(matrices, file = file.path(processedCountsDir, dataFileName))
+
+```
+
+### non-TFH Th1_17 cells
+
+```{r subset info}
+subsetName = "non-TFH_Th1_17"
+subsetNameAntigenSpecific = "non-TFH_Th1_17_AIM++"
+dataFileName = paste(subsetName, "Rdata", sep = ".")
+
+```
+
+```{r previous}
+# First, we need to add the CXCR5- gate to our data structures
+nodesToAdd = c("CXCR5") # nodes that need to be negated
+
+filterIdpos = paste0(nodesToAdd, "+")
+filterIdneg = paste0(nodesToAdd, "-")
+
+idx = which(gateList$node %in% filterIdpos)
+
+parent = gateList$parent[idx]
+
+flowJoNamePos = paste(parent, filterIdpos, sep = "/")
+flowJoNameNeg = paste(parent, filterIdneg, sep = "/")
+
+# setup the gate that will be inserted
+filterChar = paste0("`!", filterIdpos, "`")
+
+for (i in 1:length(nodesToAdd)) {
+  
+  if (filterIdneg[i] %in% gateList$node) {next}
+  
+  exprs = paste0("!", filterIdpos[i])
+  gate_ = eval(substitute(booleanFilter(v, filterId = w), list(v = as.symbol(exprs), w = filterIdneg[i])))
+  
+  gateList = rbind(gateList, data.frame(flowJoName = flowJoNameNeg[i], node = filterIdneg[i], parent = parent[i], idx = nrow(gateList)+1 ))
+  
+  for (condition_ in unique(design$condition)) {
+    for (batch_ in unique(design$batch)) {
+      gates[[condition_]][[batch_]] = c(gates[[condition_]][[batch_]], gate_)
+    }
+  }
+  
+}
+
+gateList$flowJoName[1:14]
+
+# rootpath
+rootPathGates = rbind(gateList[c(1:11,13,14),], dplyr::filter(gateList, node %in% c("CD4_RO+") )) # root path for the CD4+ RO+ cells
+
+# now add the non-THF Th1_17 node
+newNodes = c("CXCR5+", "CXCR5-", "CXCR3+", "CCR6+") # the negative node must be next to the positive of its kind
+rootPathGates = rbind(rootPathGates, gateList[match(newNodes, gateList$node), ])
+
+for (i in 1:length(newNodes)) {
+  idx = which(rootPathGates$node == newNodes[i])
+  if (str_detect(newNodes[i], "-") ) { # if is a negative gate, we will take the root path from two above.
+      rootPathGates$parent[idx] = rootPathGates$parent[idx-1]
+    } else { # else we take the node name
+      rootPathGates$parent[idx] = rootPathGates$flowJoName[idx-1]
+    } 
+  rootPathGates$flowJoName[idx] = paste0(rootPathGates$parent[idx], "/", rootPathGates$node[idx])
+}
+
+print(rootPathGates)
+
+
+# remove markers to gate for
+nodes_to_gate = level1_nodes[!(level1_nodes %in% newNodes)]
+nodes_to_gate = nodes_to_gate[nodes_to_gate != "CXCR3_dim+"] # manually remove the dim
+
+print(nodes_to_gate)
+
+
+# store root paths
+rootPaths[subsetName] = rootPathGates$flowJoName[nrow(rootPathGates)]
+rootPaths[subsetNameAntigenSpecific] = paste0(rootPaths[subsetName], "/", AIMpp_gate$node)
+```
+
+
+```{r set up clean gating sets again}
+gs = getGatingSet(design)
+```
+
+#### global compartment
+
+```{r gate the root path}
+gs = getRootPathTcells(gs, design, gates, rootPathGates)
+```
+
+```{r run IMPACD for globa TFH}
+root_path = rootPaths[subsetName]
+
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### antigen specific compartment
+
+```{r gate the root path}
+# Add the AIM+ gate
+AIMpp_gate = dplyr::filter(gateList, node %in% c("CD4_AIM++") )
+
+# add just the AIM++ node
+for (condition_ in unique(design$condition)) {
+  for (batch_ in unique(design$batch)) {
+      gs_pop_add(gs[[condition_]][[batch_]], gates[[condition_]][[batch_]][[AIMpp_gate$idx]], parent = root_path)
+  }
+}
+
+root_path = rootPaths[subsetNameAntigenSpecific]
+
+print(root_path)
+```
+
+```{r run IMPACD}
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### Process counts 
+```{r summarize counts and save}
+counts = getRawCounts(gs, design)
+
+
+# write counts to an Rdata file
+save(counts, file = file.path(rawCountsDir, dataFileName))
+```
+
+```{r process paths}
+
+# combine with design
+counts = merge(dplyr::select(counts, -condition), design, by.x = "name", by.y = "fcsName")
+# rename column name to fcsName
+colnames(counts)[colnames(counts) == "name"] = "fcsName"
+counts = dplyr::filter(counts, control == FALSE)
+
+# extract the populations
+nodes = data.frame(path = unique(counts$Population))
+nodes$compartment = ifelse(str_detect(nodes$path, "AIM"), "antigen_specific", "global") 
+
+table(nodes$compartment)
+
+
+# split if up into antigen specific ones and global ones
+nodes_ = dplyr::filter(nodes, compartment == "antigen_specific")
+nodes = dplyr::filter(nodes, compartment != "antigen_specific")
+
+nodes = processGatingPaths(nodes, max_depth = 3)
+nodes_ = processGatingPaths(nodes_, max_depth = 3)
+
+names(rootPaths)
+
+nodes = assignRoot(nodes, rootPaths[subsetName])
+nodes_ = assignRoot(nodes_, rootPaths[subsetNameAntigenSpecific])
+
+nodes = rbind(nodes, nodes_)
+
+nodes$subset = paste(subsetName, nodes$compartment, nodes$pathInCompartment, sep = "/")
+# remove trailing / from subset
+nodes$subset = str_remove(nodes$subset, "/$")
+
+nodes$subset[is.na(nodes$rootPath)] = NA
+nodes$compartment[is.na(nodes$rootPath)] = NA
+
+
+counts = merge(counts, nodes, by.x = "Population", by.y = "path")
+# this is also going to remove all of the AIM+ nodes that we didn't use
+
+```
+
+
+```{r turn into matrices}
+
+matrices = convertToMatrix(counts, depths = c(0, 1, 2, 3))
+
+matrices[["nodes"]] = nodes
+matrices[["design"]] = design
+
+# save matrices
+save(matrices, file = file.path(processedCountsDir, dataFileName))
+
+```
+
+### TFH Th1 cells
+
+```{r subset info}
+subsetName = "TFH_Th1"
+subsetNameAntigenSpecific = "TFH_Th1_AIM++"
+dataFileName = paste(subsetName, "Rdata", sep = ".")
+
+```
+
+```{r previous}
+# First, we need to add the CXCR5- gate to our data structures
+nodesToAdd = c("CCR6") # nodes that need to be negated
+
+filterIdpos = paste0(nodesToAdd, "+")
+filterIdneg = paste0(nodesToAdd, "-")
+
+idx = which(gateList$node %in% filterIdpos)
+
+parent = gateList$parent[idx]
+
+flowJoNamePos = paste(parent, filterIdpos, sep = "/")
+flowJoNameNeg = paste(parent, filterIdneg, sep = "/")
+
+# setup the gate that will be inserted
+filterChar = paste0("`!", filterIdpos, "`")
+
+for (i in 1:length(nodesToAdd)) {
+  
+  if (filterIdneg[i] %in% gateList$node) {next}
+  
+  exprs = paste0("!", filterIdpos[i])
+  gate_ = eval(substitute(booleanFilter(v, filterId = w), list(v = as.symbol(exprs), w = filterIdneg[i])))
+  
+  gateList = rbind(gateList, data.frame(flowJoName = flowJoNameNeg[i], node = filterIdneg[i], parent = parent[i], idx = nrow(gateList)+1 ))
+  
+  for (condition_ in unique(design$condition)) {
+    for (batch_ in unique(design$batch)) {
+      gates[[condition_]][[batch_]] = c(gates[[condition_]][[batch_]], gate_)
+    }
+  }
+  
+}
+
+gateList$flowJoName[1:14]
+
+# rootpath
+rootPathGates = rbind(gateList[c(1:11,13,14),], dplyr::filter(gateList, node %in% c("CD4_RO+") )) # root path for the CD4+ RO+ cells
+
+# now add the non-THF Th1_17 node
+newNodes = c("CXCR5+", "CXCR3+", "CCR6+", "CCR6-") # the negative node must be next to the positive of its kind
+rootPathGates = rbind(rootPathGates, gateList[match(newNodes, gateList$node), ])
+
+for (i in 1:length(newNodes)) {
+  idx = which(rootPathGates$node == newNodes[i])
+  if (str_detect(newNodes[i], "-") ) { # if is a negative gate, we will take the root path from two above.
+      rootPathGates$parent[idx] = rootPathGates$parent[idx-1]
+    } else { # else we take the node name
+      rootPathGates$parent[idx] = rootPathGates$flowJoName[idx-1]
+    } 
+  rootPathGates$flowJoName[idx] = paste0(rootPathGates$parent[idx], "/", rootPathGates$node[idx])
+}
+
+print(rootPathGates)
+
+
+# remove markers to gate for
+nodes_to_gate = level1_nodes[!(level1_nodes %in% newNodes)]
+nodes_to_gate = nodes_to_gate[nodes_to_gate != "CXCR3_dim+"] # manually remove the dim
+
+print(nodes_to_gate)
+
+
+# store root paths
+rootPaths[subsetName] = rootPathGates$flowJoName[nrow(rootPathGates)]
+rootPaths[subsetNameAntigenSpecific] = paste0(rootPaths[subsetName], "/", AIMpp_gate$node)
+```
+
+
+```{r set up clean gating sets again}
+gs = getGatingSet(design)
+```
+
+#### global compartment
+
+```{r gate the root path}
+gs = getRootPathTcells(gs, design, gates, rootPathGates)
+```
+
+```{r run IMPACD for globa TFH}
+root_path = rootPaths[subsetName]
+
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### antigen specific compartment
+
+```{r gate the root path}
+# Add the AIM+ gate
+AIMpp_gate = dplyr::filter(gateList, node %in% c("CD4_AIM++") )
+
+# add just the AIM++ node
+for (condition_ in unique(design$condition)) {
+  for (batch_ in unique(design$batch)) {
+      gs_pop_add(gs[[condition_]][[batch_]], gates[[condition_]][[batch_]][[AIMpp_gate$idx]], parent = root_path)
+  }
+}
+
+root_path = rootPaths[subsetNameAntigenSpecific]
+
+print(root_path)
+```
+
+```{r run IMPACD}
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### Process counts 
+```{r summarize counts and save}
+counts = getRawCounts(gs, design)
+
+
+# write counts to an Rdata file
+save(counts, file = file.path(rawCountsDir, dataFileName))
+```
+
+```{r process paths}
+
+# combine with design
+counts = merge(dplyr::select(counts, -condition), design, by.x = "name", by.y = "fcsName")
+# rename column name to fcsName
+colnames(counts)[colnames(counts) == "name"] = "fcsName"
+counts = dplyr::filter(counts, control == FALSE)
+
+# extract the populations
+nodes = data.frame(path = unique(counts$Population))
+nodes$compartment = ifelse(str_detect(nodes$path, "AIM"), "antigen_specific", "global") 
+
+table(nodes$compartment)
+
+
+# split if up into antigen specific ones and global ones
+nodes_ = dplyr::filter(nodes, compartment == "antigen_specific")
+nodes = dplyr::filter(nodes, compartment != "antigen_specific")
+
+nodes = processGatingPaths(nodes, max_depth = 3)
+nodes_ = processGatingPaths(nodes_, max_depth = 3)
+
+names(rootPaths)
+
+nodes = assignRoot(nodes, rootPaths[subsetName])
+nodes_ = assignRoot(nodes_, rootPaths[subsetNameAntigenSpecific])
+
+nodes = rbind(nodes, nodes_)
+
+nodes$subset = paste(subsetName, nodes$compartment, nodes$pathInCompartment, sep = "/")
+# remove trailing / from subset
+nodes$subset = str_remove(nodes$subset, "/$")
+
+nodes$subset[is.na(nodes$rootPath)] = NA
+nodes$compartment[is.na(nodes$rootPath)] = NA
+
+
+counts = merge(counts, nodes, by.x = "Population", by.y = "path")
+# this is also going to remove all of the AIM+ nodes that we didn't use
+
+```
+
+
+```{r turn into matrices}
+
+matrices = convertToMatrix(dplyr::filter(counts, !is.na(subset)), depths = c(0, 1, 2, 3)) # removes the CCR6+ node that is at root depth
+
+# matrices = convertToMatrix(counts, depths = c(0, 1, 2, 3))
+
+matrices[["nodes"]] = nodes
+matrices[["design"]] = design
+
+# save matrices
+save(matrices, file = file.path(processedCountsDir, dataFileName))
+
+```
+
+
+### non-TFH Th1 cells
+
+```{r subset info}
+subsetName = "non-TFH_Th1"
+subsetNameAntigenSpecific = paste0(subsetName, "_AIM++")
+dataFileName = paste(subsetName, "Rdata", sep = ".")
+
+```
+
+```{r previous}
+# First, we need to add the CXCR5- gate to our data structures
+nodesToAdd = c("CCR5", "CCR6") # nodes that need to be negated
+
+filterIdpos = paste0(nodesToAdd, "+")
+filterIdneg = paste0(nodesToAdd, "-")
+
+idx = which(gateList$node %in% filterIdpos)
+
+parent = gateList$parent[idx]
+
+flowJoNamePos = paste(parent, filterIdpos, sep = "/")
+flowJoNameNeg = paste(parent, filterIdneg, sep = "/")
+
+# setup the gate that will be inserted
+filterChar = paste0("`!", filterIdpos, "`")
+
+for (i in 1:length(nodesToAdd)) {
+  
+  if (filterIdneg[i] %in% gateList$node) {next}
+  
+  exprs = paste0("!", filterIdpos[i])
+  gate_ = eval(substitute(booleanFilter(v, filterId = w), list(v = as.symbol(exprs), w = filterIdneg[i])))
+  
+  gateList = rbind(gateList, data.frame(flowJoName = flowJoNameNeg[i], node = filterIdneg[i], parent = parent[i], idx = nrow(gateList)+1 ))
+  
+  for (condition_ in unique(design$condition)) {
+    for (batch_ in unique(design$batch)) {
+      gates[[condition_]][[batch_]] = c(gates[[condition_]][[batch_]], gate_)
+    }
+  }
+  
+}
+
+gateList$flowJoName[1:14]
+
+# rootpath
+rootPathGates = rbind(gateList[c(1:11,13,14),], dplyr::filter(gateList, node %in% c("CD4_RO+") )) # root path for the CD4+ RO+ cells
+
+# now add the non-THF Th1_17 node
+newNodes = c("CXCR5+", "CXCR5-", "CXCR3+", "CCR6+", "CCR6-") # the negative node must be next to the positive of its kind
+rootPathGates = rbind(rootPathGates, gateList[match(newNodes, gateList$node), ])
+
+for (i in 1:length(newNodes)) {
+  idx = which(rootPathGates$node == newNodes[i])
+  if (str_detect(newNodes[i], "-") ) { # if is a negative gate, we will take the root path from two above.
+      rootPathGates$parent[idx] = rootPathGates$parent[idx-1]
+    } else { # else we take the node name
+      rootPathGates$parent[idx] = rootPathGates$flowJoName[idx-1]
+    } 
+  rootPathGates$flowJoName[idx] = paste0(rootPathGates$parent[idx], "/", rootPathGates$node[idx])
+}
+
+print(rootPathGates)
+
+
+# remove markers to gate for
+nodes_to_gate = level1_nodes[!(level1_nodes %in% newNodes)]
+nodes_to_gate = nodes_to_gate[nodes_to_gate != "CXCR3_dim+"] # manually remove the dim
+
+print(nodes_to_gate)
+
+
+# store root paths
+rootPaths[subsetName] = rootPathGates$flowJoName[nrow(rootPathGates)]
+rootPaths[subsetNameAntigenSpecific] = paste0(rootPaths[subsetName], "/", AIMpp_gate$node)
+```
+
+
+```{r set up clean gating sets again}
+gs = getGatingSet(design)
+```
+
+#### global compartment
+
+```{r gate the root path}
+gs = getRootPathTcells(gs, design, gates, rootPathGates)
+```
+
+```{r run IMPACD for globa TFH}
+root_path = rootPaths[subsetName]
+
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### antigen specific compartment
+
+```{r gate the root path}
+# Add the AIM+ gate
+AIMpp_gate = dplyr::filter(gateList, node %in% c("CD4_AIM++") )
+
+# add just the AIM++ node
+for (condition_ in unique(design$condition)) {
+  for (batch_ in unique(design$batch)) {
+      gs_pop_add(gs[[condition_]][[batch_]], gates[[condition_]][[batch_]][[AIMpp_gate$idx]], parent = root_path)
+  }
+}
+
+root_path = rootPaths[subsetNameAntigenSpecific]
+
+print(root_path)
+```
+
+```{r run IMPACD}
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### Process counts 
+```{r summarize counts and save}
+counts = getRawCounts(gs, design)
+
+
+# write counts to an Rdata file
+save(counts, file = file.path(rawCountsDir, dataFileName))
+```
+
+```{r process paths}
+
+# combine with design
+counts = merge(dplyr::select(counts, -condition), design, by.x = "name", by.y = "fcsName")
+# rename column name to fcsName
+colnames(counts)[colnames(counts) == "name"] = "fcsName"
+counts = dplyr::filter(counts, control == FALSE)
+
+# extract the populations
+nodes = data.frame(path = unique(counts$Population))
+nodes$compartment = ifelse(str_detect(nodes$path, "AIM"), "antigen_specific", "global") 
+
+table(nodes$compartment)
+
+
+# split if up into antigen specific ones and global ones
+nodes_ = dplyr::filter(nodes, compartment == "antigen_specific")
+nodes = dplyr::filter(nodes, compartment != "antigen_specific")
+
+nodes = processGatingPaths(nodes, max_depth = 3)
+nodes_ = processGatingPaths(nodes_, max_depth = 3)
+
+names(rootPaths)
+
+nodes = assignRoot(nodes, rootPaths[subsetName])
+nodes_ = assignRoot(nodes_, rootPaths[subsetNameAntigenSpecific])
+
+nodes = rbind(nodes, nodes_)
+
+nodes$subset = paste(subsetName, nodes$compartment, nodes$pathInCompartment, sep = "/")
+# remove trailing / from subset
+nodes$subset = str_remove(nodes$subset, "/$")
+
+nodes$subset[is.na(nodes$rootPath)] = NA
+nodes$compartment[is.na(nodes$rootPath)] = NA
+
+
+counts = merge(counts, nodes, by.x = "Population", by.y = "path")
+# this is also going to remove all of the AIM+ nodes that we didn't use
+
+```
+
+
+```{r turn into matrices}
+
+matrices = convertToMatrix(dplyr::filter(counts, !is.na(subset)), depths = c(0, 1, 2, 3)) # removes the CCR6+ node that is at root depth
+
+# matrices = convertToMatrix(counts, depths = c(0, 1, 2, 3))
+
+matrices[["nodes"]] = nodes
+matrices[["design"]] = design
+
+# save matrices
+save(matrices, file = file.path(processedCountsDir, dataFileName))
+
+```
+
+### TFH Th17 cells
+
+```{r subset info}
+subsetName = "TFH_Th17"
+subsetNameAntigenSpecific = paste0(subsetName, "_AIM++")
+dataFileName = paste(subsetName, "Rdata", sep = ".")
+
+```
+
+```{r previous}
+# First, we need to add the CXCR5- gate to our data structures
+nodesToAdd = c("CXCR3") # nodes that need to be negated
+
+filterIdpos = paste0(nodesToAdd, "+")
+filterIdneg = paste0(nodesToAdd, "-")
+
+idx = which(gateList$node %in% filterIdpos)
+
+parent = gateList$parent[idx]
+
+flowJoNamePos = paste(parent, filterIdpos, sep = "/")
+flowJoNameNeg = paste(parent, filterIdneg, sep = "/")
+
+# setup the gate that will be inserted
+filterChar = paste0("`!", filterIdpos, "`")
+
+for (i in 1:length(nodesToAdd)) {
+  
+  if (filterIdneg[i] %in% gateList$node) {next}
+  
+  exprs = paste0("!", filterIdpos[i])
+  gate_ = eval(substitute(booleanFilter(v, filterId = w), list(v = as.symbol(exprs), w = filterIdneg[i])))
+  
+  gateList = rbind(gateList, data.frame(flowJoName = flowJoNameNeg[i], node = filterIdneg[i], parent = parent[i], idx = nrow(gateList)+1 ))
+  
+  for (condition_ in unique(design$condition)) {
+    for (batch_ in unique(design$batch)) {
+      gates[[condition_]][[batch_]] = c(gates[[condition_]][[batch_]], gate_)
+    }
+  }
+  
+}
+
+gateList$flowJoName[1:14]
+
+# rootpath
+rootPathGates = rbind(gateList[c(1:11,13,14),], dplyr::filter(gateList, node %in% c("CD4_RO+") )) # root path for the CD4+ RO+ cells
+
+# now add the THF Th17 node
+newNodes = c("CXCR5+", "CXCR3+", "CXCR3-", "CCR6+") # the negative node must be next to the positive of its kind
+rootPathGates = rbind(rootPathGates, gateList[match(newNodes, gateList$node), ])
+
+for (i in 1:length(newNodes)) {
+  idx = which(rootPathGates$node == newNodes[i])
+  if (str_detect(newNodes[i], "-") ) { # if is a negative gate, we will take the root path from two above.
+      rootPathGates$parent[idx] = rootPathGates$parent[idx-1]
+    } else { # else we take the node name
+      rootPathGates$parent[idx] = rootPathGates$flowJoName[idx-1]
+    } 
+  rootPathGates$flowJoName[idx] = paste0(rootPathGates$parent[idx], "/", rootPathGates$node[idx])
+}
+
+print(rootPathGates)
+
+
+# remove markers to gate for
+nodes_to_gate = level1_nodes[!(level1_nodes %in% newNodes)]
+nodes_to_gate = nodes_to_gate[nodes_to_gate != "CXCR3_dim+"] # manually remove the dim
+
+print(nodes_to_gate)
+
+
+# store root paths
+rootPaths[subsetName] = rootPathGates$flowJoName[nrow(rootPathGates)]
+rootPaths[subsetNameAntigenSpecific] = paste0(rootPaths[subsetName], "/", AIMpp_gate$node)
+```
+
+
+```{r set up clean gating sets again}
+gs = getGatingSet(design)
+```
+
+#### global compartment
+
+```{r gate the root path}
+gs = getRootPathTcells(gs, design, gates, rootPathGates)
+```
+
+```{r run IMPACD for globa TFH}
+root_path = rootPaths[subsetName]
+
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### antigen specific compartment
+
+```{r gate the root path}
+# Add the AIM+ gate
+AIMpp_gate = dplyr::filter(gateList, node %in% c("CD4_AIM++") )
+
+# add just the AIM++ node
+for (condition_ in unique(design$condition)) {
+  for (batch_ in unique(design$batch)) {
+      gs_pop_add(gs[[condition_]][[batch_]], gates[[condition_]][[batch_]][[AIMpp_gate$idx]], parent = root_path)
+  }
+}
+
+root_path = rootPaths[subsetNameAntigenSpecific]
+
+print(root_path)
+```
+
+```{r run IMPACD}
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### Process counts 
+```{r summarize counts and save}
+counts = getRawCounts(gs, design)
+
+
+# write counts to an Rdata file
+save(counts, file = file.path(rawCountsDir, dataFileName))
+```
+
+```{r process paths}
+
+# combine with design
+counts = merge(dplyr::select(counts, -condition), design, by.x = "name", by.y = "fcsName")
+# rename column name to fcsName
+colnames(counts)[colnames(counts) == "name"] = "fcsName"
+counts = dplyr::filter(counts, control == FALSE)
+
+# extract the populations
+nodes = data.frame(path = unique(counts$Population))
+nodes$compartment = ifelse(str_detect(nodes$path, "AIM"), "antigen_specific", "global") 
+
+table(nodes$compartment)
+
+
+# split if up into antigen specific ones and global ones
+nodes_ = dplyr::filter(nodes, compartment == "antigen_specific")
+nodes = dplyr::filter(nodes, compartment != "antigen_specific")
+
+nodes = processGatingPaths(nodes, max_depth = 3)
+nodes_ = processGatingPaths(nodes_, max_depth = 3)
+
+names(rootPaths)
+
+nodes = assignRoot(nodes, rootPaths[subsetName])
+nodes_ = assignRoot(nodes_, rootPaths[subsetNameAntigenSpecific])
+
+nodes = rbind(nodes, nodes_)
+
+nodes$subset = paste(subsetName, nodes$compartment, nodes$pathInCompartment, sep = "/")
+# remove trailing / from subset
+nodes$subset = str_remove(nodes$subset, "/$")
+
+nodes$subset[is.na(nodes$rootPath)] = NA
+nodes$compartment[is.na(nodes$rootPath)] = NA
+
+
+counts = merge(counts, nodes, by.x = "Population", by.y = "path")
+# this is also going to remove all of the AIM+ nodes that we didn't use
+
+```
+
+
+```{r turn into matrices}
+
+matrices = convertToMatrix(dplyr::filter(counts, !is.na(subset)), depths = c(0, 1, 2, 3)) # removes the CCR6+ node that is at root depth
+
+# matrices = convertToMatrix(counts, depths = c(0, 1, 2, 3))
+
+matrices[["nodes"]] = nodes
+matrices[["design"]] = design
+
+# save matrices
+save(matrices, file = file.path(processedCountsDir, dataFileName))
+
+```
+
+
+### non-TFH Th17 cells
+
+```{r subset info}
+subsetName = "non-TFH_Th17"
+subsetNameAntigenSpecific = paste0(subsetName, "_AIM++")
+dataFileName = paste(subsetName, "Rdata", sep = ".")
+
+```
+
+```{r previous}
+# First, we need to add the CXCR5- gate to our data structures
+nodesToAdd = c("CXCR5", "CXCR3") # nodes that need to be negated
+
+filterIdpos = paste0(nodesToAdd, "+")
+filterIdneg = paste0(nodesToAdd, "-")
+
+idx = which(gateList$node %in% filterIdpos)
+
+parent = gateList$parent[idx]
+
+flowJoNamePos = paste(parent, filterIdpos, sep = "/")
+flowJoNameNeg = paste(parent, filterIdneg, sep = "/")
+
+# setup the gate that will be inserted
+filterChar = paste0("`!", filterIdpos, "`")
+
+for (i in 1:length(nodesToAdd)) {
+  
+  if (filterIdneg[i] %in% gateList$node) {next}
+  
+  exprs = paste0("!", filterIdpos[i])
+  gate_ = eval(substitute(booleanFilter(v, filterId = w), list(v = as.symbol(exprs), w = filterIdneg[i])))
+  
+  gateList = rbind(gateList, data.frame(flowJoName = flowJoNameNeg[i], node = filterIdneg[i], parent = parent[i], idx = nrow(gateList)+1 ))
+  
+  for (condition_ in unique(design$condition)) {
+    for (batch_ in unique(design$batch)) {
+      gates[[condition_]][[batch_]] = c(gates[[condition_]][[batch_]], gate_)
+    }
+  }
+  
+}
+
+gateList$flowJoName[1:14]
+
+# rootpath
+rootPathGates = rbind(gateList[c(1:11,13,14),], dplyr::filter(gateList, node %in% c("CD4_RO+") )) # root path for the CD4+ RO+ cells
+
+# now add the THF Th17 node
+newNodes = c("CXCR5+", "CXCR5-", "CXCR3+", "CXCR3-", "CCR6+") # the negative node must be next to the positive of its kind
+rootPathGates = rbind(rootPathGates, gateList[match(newNodes, gateList$node), ])
+
+for (i in 1:length(newNodes)) {
+  idx = which(rootPathGates$node == newNodes[i])
+  if (str_detect(newNodes[i], "-") ) { # if is a negative gate, we will take the root path from two above.
+      rootPathGates$parent[idx] = rootPathGates$parent[idx-1]
+    } else { # else we take the node name
+      rootPathGates$parent[idx] = rootPathGates$flowJoName[idx-1]
+    } 
+  rootPathGates$flowJoName[idx] = paste0(rootPathGates$parent[idx], "/", rootPathGates$node[idx])
+}
+
+print(rootPathGates)
+
+
+# remove markers to gate for
+nodes_to_gate = level1_nodes[!(level1_nodes %in% newNodes)]
+nodes_to_gate = nodes_to_gate[nodes_to_gate != "CXCR3_dim+"] # manually remove the dim
+
+print(nodes_to_gate)
+
+
+# store root paths
+rootPaths[subsetName] = rootPathGates$flowJoName[nrow(rootPathGates)]
+rootPaths[subsetNameAntigenSpecific] = paste0(rootPaths[subsetName], "/", AIMpp_gate$node)
+```
+
+
+```{r set up clean gating sets again}
+gs = getGatingSet(design)
+```
+
+#### global compartment
+```{r gate the root path}
+gs = getRootPathTcells(gs, design, gates, rootPathGates)
+```
+
+```{r run IMPACD for globa TFH}
+root_path = rootPaths[subsetName]
+
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### antigen specific compartment
+```{r gate the root path}
+# Add the AIM+ gate
+AIMpp_gate = dplyr::filter(gateList, node %in% c("CD4_AIM++") )
+
+# add just the AIM++ node
+for (condition_ in unique(design$condition)) {
+  for (batch_ in unique(design$batch)) {
+      gs_pop_add(gs[[condition_]][[batch_]], gates[[condition_]][[batch_]][[AIMpp_gate$idx]], parent = root_path)
+  }
+}
+
+root_path = rootPaths[subsetNameAntigenSpecific]
+
+print(root_path)
+```
+
+```{r run IMPACD}
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### Process counts 
+```{r summarize counts and save}
+counts = getRawCounts(gs, design)
+
+
+# write counts to an Rdata file
+save(counts, file = file.path(rawCountsDir, dataFileName))
+```
+
+```{r process paths}
+
+# combine with design
+counts = merge(dplyr::select(counts, -condition), design, by.x = "name", by.y = "fcsName")
+# rename column name to fcsName
+colnames(counts)[colnames(counts) == "name"] = "fcsName"
+counts = dplyr::filter(counts, control == FALSE)
+
+# extract the populations
+nodes = data.frame(path = unique(counts$Population))
+nodes$compartment = ifelse(str_detect(nodes$path, "AIM"), "antigen_specific", "global") 
+
+table(nodes$compartment)
+
+
+# split if up into antigen specific ones and global ones
+nodes_ = dplyr::filter(nodes, compartment == "antigen_specific")
+nodes = dplyr::filter(nodes, compartment != "antigen_specific")
+
+nodes = processGatingPaths(nodes, max_depth = 3)
+nodes_ = processGatingPaths(nodes_, max_depth = 3)
+
+names(rootPaths)
+
+nodes = assignRoot(nodes, rootPaths[subsetName])
+nodes_ = assignRoot(nodes_, rootPaths[subsetNameAntigenSpecific])
+
+nodes = rbind(nodes, nodes_)
+
+
+nodes$subset = paste(subsetName, nodes$compartment, nodes$pathInCompartment, sep = "/")
+# remove trailing / from subset
+nodes$subset = str_remove(nodes$subset, "/$")
+
+nodes$subset[is.na(nodes$rootPath)] = NA
+nodes$compartment[is.na(nodes$rootPath)] = NA
+
+table(nodes$rootPath)
+
+
+counts = merge(counts, nodes, by.x = "Population", by.y = "path")
+# this is also going to remove all of the AIM+ nodes that we didn't use
+
+```
+
+
+```{r turn into matrices}
+
+matrices = convertToMatrix(dplyr::filter(counts, !is.na(subset)), depths = c(0, 1, 2, 3)) # removes the CCR6+ node that is at root depth
+
+# matrices = convertToMatrix(counts, depths = c(0, 1, 2, 3))
+
+matrices[["nodes"]] = nodes
+matrices[["design"]] = design
+
+# save matrices
+save(matrices, file = file.path(processedCountsDir, dataFileName))
+
+```
+
+### TFH Th2 cells
+
+```{r subset info}
+subsetName = "TFH_Th2"
+subsetNameAntigenSpecific = paste0(subsetName, "_AIM++")
+dataFileName = paste(subsetName, "Rdata", sep = ".")
+
+```
+
+```{r previous}
+nodesToAdd = c("CXCR3", "CCR6") # nodes that need to be negated
+
+filterIdpos = paste0(nodesToAdd, "+")
+filterIdneg = paste0(nodesToAdd, "-")
+
+idx = which(gateList$node %in% filterIdpos)
+
+parent = gateList$parent[idx]
+
+flowJoNamePos = paste(parent, filterIdpos, sep = "/")
+flowJoNameNeg = paste(parent, filterIdneg, sep = "/")
+
+# setup the gate that will be inserted
+filterChar = paste0("`!", filterIdpos, "`")
+
+for (i in 1:length(nodesToAdd)) {
+  
+  if (filterIdneg[i] %in% gateList$node) {next}
+  
+  exprs = paste0("!", filterIdpos[i])
+  gate_ = eval(substitute(booleanFilter(v, filterId = w), list(v = as.symbol(exprs), w = filterIdneg[i])))
+  
+  gateList = rbind(gateList, data.frame(flowJoName = flowJoNameNeg[i], node = filterIdneg[i], parent = parent[i], idx = nrow(gateList)+1 ))
+  
+  for (condition_ in unique(design$condition)) {
+    for (batch_ in unique(design$batch)) {
+      gates[[condition_]][[batch_]] = c(gates[[condition_]][[batch_]], gate_)
+    }
+  }
+  
+}
+
+gateList$flowJoName[1:14]
+
+# rootpath
+rootPathGates = rbind(gateList[c(1:11,13,14),], dplyr::filter(gateList, node %in% c("CD4_RO+") )) # root path for the CD4+ RO+ cells
+
+# now add the THF Th17 node
+newNodes = c("CXCR5+", "CXCR3+", "CXCR3-", "CCR6+", "CCR6-", "CCR4+") # the negative node must be next to the positive of its kind
+rootPathGates = rbind(rootPathGates, gateList[match(newNodes, gateList$node), ])
+
+for (i in 1:length(newNodes)) {
+  idx = which(rootPathGates$node == newNodes[i])
+  if (str_detect(newNodes[i], "-") ) { # if is a negative gate, we will take the root path from two above.
+      rootPathGates$parent[idx] = rootPathGates$parent[idx-1]
+    } else { # else we take the node name
+      rootPathGates$parent[idx] = rootPathGates$flowJoName[idx-1]
+    } 
+  rootPathGates$flowJoName[idx] = paste0(rootPathGates$parent[idx], "/", rootPathGates$node[idx])
+}
+
+print(rootPathGates)
+
+
+# remove markers to gate for
+nodes_to_gate = level1_nodes[!(level1_nodes %in% newNodes)]
+nodes_to_gate = nodes_to_gate[nodes_to_gate != "CXCR3_dim+"] # manually remove the dim
+
+print(nodes_to_gate)
+
+
+# store root paths
+rootPaths[subsetName] = rootPathGates$flowJoName[nrow(rootPathGates)]
+rootPaths[subsetNameAntigenSpecific] = paste0(rootPaths[subsetName], "/", AIMpp_gate$node)
+```
+
+
+```{r set up clean gating sets again}
+gs = getGatingSet(design)
+```
+
+#### global TFH Th2
+
+```{r gate the root path}
+gs = getRootPathTcells(gs, design, gates, rootPathGates)
+```
+
+```{r run IMPACD for globa TFH}
+root_path = rootPaths[subsetName]
+
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### antigen specific compartment
+
+```{r gate the root path}
+# Add the AIM+ gate
+AIMpp_gate = dplyr::filter(gateList, node %in% c("CD4_AIM++") )
+
+# add just the AIM++ node
+for (condition_ in unique(design$condition)) {
+  for (batch_ in unique(design$batch)) {
+      gs_pop_add(gs[[condition_]][[batch_]], gates[[condition_]][[batch_]][[AIMpp_gate$idx]], parent = root_path)
+  }
+}
+
+root_path = rootPaths[subsetNameAntigenSpecific]
+
+print(root_path)
+```
+
+```{r run IMPACD}
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### Process counts 
+```{r summarize counts and save}
+counts = getRawCounts(gs, design)
+
+
+# write counts to an Rdata file
+save(counts, file = file.path(rawCountsDir, dataFileName))
+```
+
+```{r process paths}
+
+# combine with design
+counts = merge(dplyr::select(counts, -condition), design, by.x = "name", by.y = "fcsName")
+# rename column name to fcsName
+colnames(counts)[colnames(counts) == "name"] = "fcsName"
+counts = dplyr::filter(counts, control == FALSE)
+
+# extract the populations
+nodes = data.frame(path = unique(counts$Population))
+nodes$compartment = ifelse(str_detect(nodes$path, "AIM"), "antigen_specific", "global") 
+
+table(nodes$compartment)
+
+
+# split if up into antigen specific ones and global ones
+nodes_ = dplyr::filter(nodes, compartment == "antigen_specific")
+nodes = dplyr::filter(nodes, compartment != "antigen_specific")
+
+nodes = processGatingPaths(nodes, max_depth = 3)
+nodes_ = processGatingPaths(nodes_, max_depth = 3)
+
+names(rootPaths)
+
+nodes = assignRoot(nodes, rootPaths[subsetName])
+nodes_ = assignRoot(nodes_, rootPaths[subsetNameAntigenSpecific])
+
+nodes = rbind(nodes, nodes_)
+
+nodes$subset = paste(subsetName, nodes$compartment, nodes$pathInCompartment, sep = "/")
+# remove trailing / from subset
+nodes$subset = str_remove(nodes$subset, "/$")
+
+nodes$subset[is.na(nodes$rootPath)] = NA
+nodes$compartment[is.na(nodes$rootPath)] = NA
+
+
+counts = merge(counts, nodes, by.x = "Population", by.y = "path")
+# this is also going to remove all of the AIM+ nodes that we didn't use
+
+```
+
+
+```{r turn into matrices}
+
+matrices = convertToMatrix(dplyr::filter(counts, !is.na(subset)), depths = c(0, 1, 2, 3)) # removes the CCR6+ node that is at root depth
+
+# matrices = convertToMatrix(counts, depths = c(0, 1, 2, 3))
+
+matrices[["nodes"]] = nodes
+matrices[["design"]] = design
+
+# save matrices
+save(matrices, file = file.path(processedCountsDir, dataFileName))
+
+```
+
+### non-TFH Th2 cells
+
+```{r subset info}
+subsetName = "non-TFH_Th2"
+subsetNameAntigenSpecific = paste0(subsetName, "_AIM++")
+dataFileName = paste(subsetName, "Rdata", sep = ".")
+
+```
+
+```{r previous}
+nodesToAdd = c("CXCR5", "CXCR3", "CCR6") # nodes that need to be negated
+
+filterIdpos = paste0(nodesToAdd, "+")
+filterIdneg = paste0(nodesToAdd, "-")
+
+idx = which(gateList$node %in% filterIdpos)
+
+parent = gateList$parent[idx]
+
+flowJoNamePos = paste(parent, filterIdpos, sep = "/")
+flowJoNameNeg = paste(parent, filterIdneg, sep = "/")
+
+# setup the gate that will be inserted
+filterChar = paste0("`!", filterIdpos, "`")
+
+for (i in 1:length(nodesToAdd)) {
+  
+  if (filterIdneg[i] %in% gateList$node) {next}
+  
+  exprs = paste0("!", filterIdpos[i])
+  gate_ = eval(substitute(booleanFilter(v, filterId = w), list(v = as.symbol(exprs), w = filterIdneg[i])))
+  
+  gateList = rbind(gateList, data.frame(flowJoName = flowJoNameNeg[i], node = filterIdneg[i], parent = parent[i], idx = nrow(gateList)+1 ))
+  
+  for (condition_ in unique(design$condition)) {
+    for (batch_ in unique(design$batch)) {
+      gates[[condition_]][[batch_]] = c(gates[[condition_]][[batch_]], gate_)
+    }
+  }
+  
+}
+
+gateList$flowJoName[1:14]
+
+# rootpath
+rootPathGates = rbind(gateList[c(1:11,13,14),], dplyr::filter(gateList, node %in% c("CD4_RO+") )) # root path for the CD4+ RO+ cells
+
+# now add the THF Th17 node
+newNodes = c("CXCR5+", "CXCR5-", "CXCR3+", "CXCR3-", "CCR6+", "CCR6-", "CCR4+") # the negative node must be next to the positive of its kind
+rootPathGates = rbind(rootPathGates, gateList[match(newNodes, gateList$node), ])
+
+for (i in 1:length(newNodes)) {
+  idx = which(rootPathGates$node == newNodes[i])
+  if (str_detect(newNodes[i], "-") ) { # if is a negative gate, we will take the root path from two above.
+      rootPathGates$parent[idx] = rootPathGates$parent[idx-1]
+    } else { # else we take the node name
+      rootPathGates$parent[idx] = rootPathGates$flowJoName[idx-1]
+    } 
+  rootPathGates$flowJoName[idx] = paste0(rootPathGates$parent[idx], "/", rootPathGates$node[idx])
+}
+
+print(rootPathGates)
+
+
+# remove markers to gate for
+nodes_to_gate = level1_nodes[!(level1_nodes %in% newNodes)]
+nodes_to_gate = nodes_to_gate[nodes_to_gate != "CXCR3_dim+"] # manually remove the dim
+
+print(nodes_to_gate)
+
+
+# store root paths
+rootPaths[subsetName] = rootPathGates$flowJoName[nrow(rootPathGates)]
+rootPaths[subsetNameAntigenSpecific] = paste0(rootPaths[subsetName], "/", AIMpp_gate$node)
+```
+
+
+```{r set up clean gating sets again}
+gs = getGatingSet(design)
+```
+
+#### global compartment
+
+```{r gate the root path}
+gs = getRootPathTcells(gs, design, gates, rootPathGates)
+```
+
+```{r run IMPACD for globa TFH}
+root_path = rootPaths[subsetName]
+
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### antigen specific compartment
+
+```{r gate the root path}
+# Add the AIM+ gate
+AIMpp_gate = dplyr::filter(gateList, node %in% c("CD4_AIM++") )
+
+# add just the AIM++ node
+for (condition_ in unique(design$condition)) {
+  for (batch_ in unique(design$batch)) {
+      gs_pop_add(gs[[condition_]][[batch_]], gates[[condition_]][[batch_]][[AIMpp_gate$idx]], parent = root_path)
+  }
+}
+
+root_path = rootPaths[subsetNameAntigenSpecific]
+
+print(root_path)
+```
+
+```{r run IMPACD}
+gs = gateIMPACD(gs, design, level1_gates, nodes_to_gate, gatemetadata, root_path)
+```
+
+#### Process counts 
+```{r summarize counts and save}
+counts = getRawCounts(gs, design)
+
+
+# write counts to an Rdata file
+save(counts, file = file.path(rawCountsDir, dataFileName))
+```
+
+```{r process paths}
+
+# combine with design
+counts = merge(dplyr::select(counts, -condition), design, by.x = "name", by.y = "fcsName")
+# rename column name to fcsName
+colnames(counts)[colnames(counts) == "name"] = "fcsName"
+counts = dplyr::filter(counts, control == FALSE)
+
+# extract the populations
+nodes = data.frame(path = unique(counts$Population))
+nodes$compartment = ifelse(str_detect(nodes$path, "AIM"), "antigen_specific", "global") 
+
+table(nodes$compartment)
+
+
+# split if up into antigen specific ones and global ones
+nodes_ = dplyr::filter(nodes, compartment == "antigen_specific")
+nodes = dplyr::filter(nodes, compartment != "antigen_specific")
+
+nodes = processGatingPaths(nodes, max_depth = 3)
+nodes_ = processGatingPaths(nodes_, max_depth = 3)
+
+names(rootPaths)
+
+nodes = assignRoot(nodes, rootPaths[subsetName])
+nodes_ = assignRoot(nodes_, rootPaths[subsetNameAntigenSpecific])
+
+nodes = rbind(nodes, nodes_)
+
+nodes$subset = paste(subsetName, nodes$compartment, nodes$pathInCompartment, sep = "/")
+# remove trailing / from subset
+nodes$subset = str_remove(nodes$subset, "/$")
+
+nodes$subset[is.na(nodes$rootPath)] = NA
+nodes$compartment[is.na(nodes$rootPath)] = NA
+
+
+counts = merge(counts, nodes, by.x = "Population", by.y = "path")
+# this is also going to remove all of the AIM+ nodes that we didn't use
+
+```
+
+
+```{r turn into matrices}
+
+matrices = convertToMatrix(dplyr::filter(counts, !is.na(subset)), depths = c(0, 1, 2, 3)) # removes the CCR6+ node that is at root depth
+
+# matrices = convertToMatrix(counts, depths = c(0, 1, 2, 3))
+
+matrices[["nodes"]] = nodes
+matrices[["design"]] = design
+
+# save matrices
+save(matrices, file = file.path(processedCountsDir, dataFileName))
+
+```
+

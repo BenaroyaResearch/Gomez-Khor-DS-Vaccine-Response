@@ -1,0 +1,245 @@
+---
+title: "Bcell level 1 and modifier analysis"
+author: "Rebecca Gomez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---   
+
+```{r set up directories, echo = FALSE, message = FALSE, warning = FALSE}
+getwd() #find out where working directory is set
+setwd("~/Khor_covidvax_response_IMPACD") #set working directory
+
+baseDir = getwd()
+dataDir = file.path(baseDir, 'data_RG_2025_05')
+plotsDir = file.path(baseDir, 'plots_RG_2025_05')
+resultsDir = file.path(baseDir, 'results_RG_2025_05')
+tablesDir = file.path(baseDir, 'tables_RG_2025_05')
+fcsDir = file.path(baseDir, "fcs_files_RG_2025_05")
+
+dirs_to_create <- list(dataDir, plotsDir, resultsDir, tablesDir, fcsDir)
+lapply(dirs_to_create, dir.create, recursive = TRUE, showWarnings = FALSE)
+
+```
+
+```{r load libraries, echo = FALSE, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(data.table)
+library(knitr)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+
+library(readxl) # open excels
+library(circlize) # color gradients
+
+# library(flowWorkspace)
+# library(CytoML)
+# library(IMPACD)
+
+library(UpSetR)
+library(tidyverse)
+library(betareg)
+library(limma)
+library(emmeans)
+library(circlize)
+library(ComplexHeatmap)
+library(openxlsx)
+library(VennDiagram)
+```
+
+```{r knitr defaults}
+# opts_chunk$set(fig.width=6, fig.height=4.0, cache = TRUE, echo=FALSE, warning=FALSE, message=FALSE, results='hide')
+opts_chunk$set(fig.width=6, fig.height=5, cache = TRUE, warning=FALSE, message=FALSE, fig.align = 'center')
+
+```
+
+# Setup colors
+
+```{r load data}
+
+colors = c()
+
+# colors$heatmap = colorRamp2(c(-4, 0, 4), c("#0033a0", "white", "#FE5000")) # colors for the heatmap
+
+col_fun = colorRamp2(c(-3, 0, 3), c("#2166AC", "white", "#B2182B")) # colors for the heatmap
+colors$heatmap = col_fun
+
+colors$studyGroup = c("#40A184", "#E0795C")
+colors$studyGroup = c("black", "#E6847D")
+names(colors$studyGroup) = c("Control", "Down Syndrome")
+
+# colors$studyGroupShort = c("#40A184", "#E0795C")
+colors$studyGroupShort = c("black", "#E6847D")
+names(colors$studyGroupShort) = c("TC", "DS")
+
+# colors$condition = c("#60B1F5", "#F5A01D", "#89F572", "#A0488B")
+# names(colors$condition) = unique(design$condition)
+# 
+# colors$timePoint = c("#CCEDE7", "#8AA19D", "#6D7F7B")
+# names(colors$timePoint) = sort(unique(design$timePoint))
+
+colors$sex = c("#F0A8A8", "#60B1F5")
+names(colors$sex) = c("female", "male")
+
+colors$compartment = c("#D5EFD3", "#EFD2B9")
+names(colors$compartment) = c("global", "antigen_specific")
+
+colors$volcano = c("#2166AC", "#B2182B", "#E7E7E7")
+names(colors$volcano) = c("down", "up", "ns")
+
+# make a color map ageAtDraw
+# colors$ageAtDraw = colorRamp2(c(min(design$ageAtDraw), max(design$ageAtDraw)), c("#E7E7E7", "#818181")) # colors for the heatmap
+colors$ageAtDraw = colorRamp2(c(5, 52), c("#E7E7E7", "#818181")) # colors for the heatmap
+```
+
+# Run DS vs TC comparisons
+
+```{r load functions and figure out files}
+
+
+
+
+####script for annotating Bcells_non-PB Rdata object only ######
+# 
+# # Define file paths:
+# baseDir <- "data/counts/flow"
+# annotationDir <- "flow_annotation"
+# 
+# # Load the timepoint key:
+# timepoint_key <- read.csv(
+#   file.path(baseDir, annotationDir, "longitudinalDrawDescription_Timepoint_key.csv"),
+#   stringsAsFactors = FALSE
+# )
+# 
+# # Load matrices for Bcells_non-PB.Rdata:
+# rdata_file <- file.path(baseDir, "Bcells_non-PB.Rdata")
+# load(rdata_file)
+# 
+# # Verify initial structure
+# message("✅ Loaded: ", rdata_file)
+# message("Initial columns in matrices$design: ", paste(colnames(matrices$design), collapse = ", "))
+# 
+# # Rename 'ALId' column to 'sampleName':
+# matrices$design <- matrices$design %>%
+#   rename(sampleName = ALId)
+# 
+# # verification after renaming:
+# if (!"sampleName" %in% colnames(matrices$design)) {
+#   stop("❌ Column rename failed: 'sampleName' column not found.")
+# } else {
+#   message("✅ Column renamed successfully: 'ALId' → 'sampleName'")
+# }
+# 
+# # Add timePoint column via join on longitudinalDrawDescription:
+# matrices$design <- matrices$design %>%
+#   left_join(timepoint_key, by = "longitudinalDrawDescription") %>%
+#   rename(timePoint = timePoint)
+# 
+# # Verify successful annotation:
+# if (!"timePoint" %in% colnames(matrices$design)) {
+#   stop("❌ Timepoint annotation failed: 'timePoint' column not found.")
+# } else {
+#   message("✅ Timepoint annotation successful. Unique timePoints: ", 
+#           paste(unique(matrices$design$timePoint), collapse = ", "))
+# }
+# 
+# # Final verification of structure:
+# message("Final columns in matrices$design: ", paste(colnames(matrices$design), collapse = ", "))
+# 
+# # Save back into the original Rdata file:
+# save(matrices, file = rdata_file)
+# 
+# message("✅ Annotated and saved to ", rdata_file)
+
+# #### changing timePoint annotation only for xpb455943418, changing T2 -> T1 and saving files back to flow dir;
+# #### should be done only once
+
+# baseDir <- "/Users/rgomez/Khor_covidvax_response_IMPACD"
+# original_dir <- "data/counts/flow"
+# 
+# # Updated annotation CSV filename
+# timepoint_annotation <- read.csv(
+#   file.path(baseDir, "flow_annotation", "Bcell_Timepoint_annotation.csv"),
+#   stringsAsFactors = FALSE
+# )
+# 
+# # Specific Rdata file to modify
+# file_to_modify <- file.path(original_dir, "Bcells_non-PB.Rdata")
+# 
+# sample_to_update <- "AL073"
+# 
+# message("\nAnnotating: ", file_to_modify)
+# 
+# load(file_to_modify)  # loads "matrices"
+# 
+# # Check if sampleName exists
+# if (!"sampleName" %in% colnames(matrices$design)) {
+#   stop("⚠️ 'sampleName' column not found.")
+# }
+# 
+# # Update timePoint specifically for AL073 (T2 -> T1)
+# update_timepoints <- timepoint_annotation %>%
+#   filter(sampleName == sample_to_update) %>%
+#   select(sampleName, timePoint)
+# 
+# matrices$design <- matrices$design %>%
+#   left_join(update_timepoints, by = "sampleName", suffix = c("", ".updated")) %>%
+#   mutate(timePoint = coalesce(timePoint.updated, timePoint)) %>%
+#   select(-timePoint.updated)
+# 
+# message("Annotations successful for: ", file_to_modify)
+# 
+# # Save updated matrices back to original file
+# save(matrices, file = file_to_modify)
+# 
+# message("✅ Annotated and saved to ", file_to_modify)
+
+
+
+####### run only Bcel1 Rdata object #########
+
+source("R/flow_Bcell_analysis_RG_2025_11.R")
+
+run_DS_vs_TC("/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/roots/Full_object_Bcells.Rdata")
+
+# # # list all R data files in data
+# files <- list.files("data/counts/flow", pattern = ".Rdata", full.names = TRUE)
+# # # issues: 66, 67,
+#  for (iFile in seq_along(files)) {
+# 
+#   file <- files[iFile]
+#   file_base <- tools::file_path_sans_ext(basename(file))
+# 
+#   run_DS_vs_TC(file_base)
+#  }
+
+```
+
+# Aging
+```{r run aging analyses}
+source("cytof_functions.R")
+
+# list all R data files in data/counts
+files = list.files("data/counts", pattern = ".Rdata", full.names = T)
+
+
+for (iFile in 1:length(files) ) {
+# for (iFile in 30 ) {
+  file = files[iFile]
+  # extract the name of the file, without the path and extension
+  name = gsub("data/counts/", "", file)
+  name = gsub(".Rdata", "", name)
+  
+  run_age_analysis(name)
+}
+
+```
+

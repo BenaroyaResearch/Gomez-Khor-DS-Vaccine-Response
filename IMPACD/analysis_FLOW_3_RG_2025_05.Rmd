@@ -1,0 +1,406 @@
+---
+title: "CyTOF data - CD4Teff root node - IMPACD modifier analysis testing"
+author: "Rebecca Gomez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---   
+
+```{r set up directories, echo = FALSE, message = FALSE, warning = FALSE}
+getwd() #find out where working directory is set
+setwd("~/Khor_covidvax_response_IMPACD") #set working directory
+
+baseDir = getwd()
+dataDir = file.path(baseDir, 'data_RG_2025_05')
+plotsDir = file.path(baseDir, 'plots_RG_2025_05')
+resultsDir = file.path(baseDir, 'results_RG_2025_05')
+tablesDir = file.path(baseDir, 'tables_RG_2025_05')
+fcsDir = file.path(baseDir, "fcs_files_RG_2025_05")
+
+dirs_to_create <- list(dataDir, plotsDir, resultsDir, tablesDir, fcsDir)
+lapply(dirs_to_create, dir.create, recursive = TRUE, showWarnings = FALSE)
+
+```
+
+```{r load libraries, echo = FALSE, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(data.table)
+library(knitr)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+
+library(readxl) # open excels
+library(circlize) # color gradients
+
+# library(flowWorkspace)
+# library(CytoML)
+# library(IMPACD)
+
+library(UpSetR)
+library(tidyverse)
+library(betareg)
+library(limma)
+library(emmeans)
+library(circlize)
+library(ComplexHeatmap)
+library(openxlsx)
+library(VennDiagram)
+```
+
+```{r knitr defaults}
+# opts_chunk$set(fig.width=6, fig.height=4.0, cache = TRUE, echo=FALSE, warning=FALSE, message=FALSE, results='hide')
+opts_chunk$set(fig.width=6, fig.height=5, cache = TRUE, warning=FALSE, message=FALSE, fig.align = 'center')
+
+```
+
+# Setup colors
+
+```{r load data}
+colors <- list()
+#colors = c()
+
+# colors$heatmap = colorRamp2(c(-4, 0, 4), c("#0033a0", "white", "#FE5000")) # colors for the heatmap
+
+col_fun = colorRamp2(c(-3, 0, 3), c("#2166AC", "white", "#B2182B")) # colors for the heatmap
+colors$heatmap = col_fun
+
+colors$studyGroup = c("#40A184", "#E0795C")
+colors$studyGroup = c("black", "#E6847D")
+names(colors$studyGroup) = c("Control", "Down Syndrome")
+
+# colors$studyGroupShort = c("#40A184", "#E0795C")
+colors$studyGroupShort = c("black", "#E6847D")
+names(colors$studyGroupShort) = c("TC", "DS")
+
+# colors$condition = c("#60B1F5", "#F5A01D", "#89F572", "#A0488B")
+# names(colors$condition) = unique(design$condition)
+# 
+# colors$timePoint = c("#CCEDE7", "#8AA19D", "#6D7F7B")
+# names(colors$timePoint) = sort(unique(design$timePoint))
+
+colors$sex = c("#F0A8A8", "#60B1F5")
+names(colors$sex) = c("female", "male")
+
+colors$compartment = c("#D5EFD3", "#EFD2B9")
+names(colors$compartment) = c("global", "antigen_specific")
+
+colors$volcano = c("#2166AC", "#B2182B", "#E7E7E7")
+names(colors$volcano) = c("down", "up", "ns")
+
+# make a color map ageAtDraw
+# colors$ageAtDraw = colorRamp2(c(min(design$ageAtDraw), max(design$ageAtDraw)), c("#E7E7E7", "#818181")) # colors for the heatmap
+colors$ageAtDraw = colorRamp2(c(5, 52), c("#E7E7E7", "#818181")) # colors for the heatmap
+
+is.list(colors)
+names(colors)
+```
+
+# Run DS vs TC comparisons
+# Anno and timepoint addition to newly created naive_CD4_AIMpp.Rdata, only! (RG 08 Enero 2026)
+
+```{r annotate_naive_CD4_AIMpp, message=TRUE}
+
+library(dplyr)
+library(readr)
+
+# ---- Paths ----
+baseDir <- "/Users/rgomez/Khor_covidvax_response_IMPACD"
+target_file <- file.path(baseDir, "data/counts/flow", "naive_CD4_AIMpp.Rdata")
+
+stopifnot(file.exists(target_file))
+
+metadata_annotation <- read.csv(
+  file.path(baseDir, "flow_annotation", "DS_with_annotation_flow.csv"),
+  stringsAsFactors = FALSE
+)
+
+timepoint_key <- read.csv(
+  file.path(baseDir, "flow_annotation", "longitudinalDrawDescription_Timepoint_key.csv"),
+  stringsAsFactors = FALSE
+)
+
+# ---- Load the one matrices object ----
+message("\nAnnotating ONLY: ", target_file)
+load(target_file)  # loads "matrices"
+stopifnot(exists("matrices"))
+
+# Basic structure checks
+stopifnot(is.list(matrices))
+stopifnot("design" %in% names(matrices))
+stopifnot(is.data.frame(matrices$design))
+stopifnot("sampleName" %in% colnames(matrices$design))
+
+# ---- 1) Patch metadata for a small set of samples ----
+samples_needing_update <- c(
+  "exp_D_MN_B06_AL044", "exp_C_CE_B06_AL044", "exp_A_DM_B06_AL044", "exp_B_SP_B06_AL044",
+  "exp_A_DM_B08_AL065", "exp_B_SP_B08_AL065", "exp_D_MN_B08_AL065", "exp_C_CE_B08_AL065",
+  "exp_C_CE_B08_AL069", "exp_A_DM_B08_AL069", "exp_B_SP_B08_AL069", "exp_D_MN_B08_AL069",
+  "exp_C_CE_B17_AL149", "exp_B_SP_B17_AL149", "exp_D_MN_B17_AL149", "exp_A_DM_B17_AL149",
+  "exp_A_DM_B17_AL158", "exp_B_SP_B17_AL158", "exp_C_CE_B17_AL158", "exp_D_MN_B17_AL158"
+)
+
+update_metadata <- metadata_annotation %>%
+  filter(sampleName %in% samples_needing_update) %>%
+  select(sampleName, ageAtDraw, sex, longitudinalDrawDescription, patientType)
+
+# Join + fill only missing values (existing values win)
+matrices$design <- matrices$design %>%
+  left_join(update_metadata, by = "sampleName", suffix = c("", ".new")) %>%
+  mutate(
+    ageAtDraw = coalesce(ageAtDraw, ageAtDraw.new),
+    sex = coalesce(sex, sex.new),
+    longitudinalDrawDescription = coalesce(longitudinalDrawDescription, longitudinalDrawDescription.new),
+    patientType = coalesce(patientType, patientType.new)
+  ) %>%
+  select(-ends_with(".new"))
+
+# ---- 2) Add/refresh timePoint from longitudinalDrawDescription ----
+# (timepoint_key must have columns: longitudinalDrawDescription, timePoint)
+matrices$design <- matrices$design %>%
+  left_join(timepoint_key, by = "longitudinalDrawDescription") %>%
+  rename(timePoint = timePoint)
+
+# ---- 3) One-off timePoint correction for AL073 samples (set to T1) ----
+samples_timePoint_fix <- c(
+  "exp_C_CE_B09_AL073",
+  "exp_A_DM_B09_AL073",
+  "exp_B_SP_B09_AL073"
+)
+
+matrices$design <- matrices$design %>%
+  mutate(timePoint = ifelse(sampleName %in% samples_timePoint_fix, "T1", timePoint))
+
+# ---- Quick verification ----
+message("Rows in design: ", nrow(matrices$design))
+message("Non-NA timePoint: ", sum(!is.na(matrices$design$timePoint)))
+message("AL073 timePoint values: ")
+print(matrices$design %>% filter(sampleName %in% samples_timePoint_fix) %>% select(sampleName, longitudinalDrawDescription, timePoint))
+
+# ---- Save back to the same file ----
+save(matrices, file = target_file)
+message("✅ Annotated and saved: ", target_file)
+
+
+```
+
+```{r load functions and figure out files}
+
+
+source("R/flow_4_analysis_RG_2025_09.R")
+
+### overwriting and saving files back to flow dir; should be run only once######
+
+# original_dir <- "data/counts/flow"
+# backup_dir <- "data/counts/flow_unmodified_backup"
+# 
+# # Create backup directory if it doesn't exist
+# if (!dir.exists(backup_dir)) {
+#   dir.create(backup_dir, recursive = TRUE)
+#   message("Backup directory created.")
+# } else {
+#   message("Backup directory already exists; no files will be overwritten.")
+# }
+# 
+# # List all original Rdata files
+# files <- list.files(original_dir, pattern = "\\.Rdata$", full.names = TRUE)
+# 
+# # Determine which files haven't been backed up yet
+# backup_files <- file.path(backup_dir, basename(files))
+# files_to_copy <- files[!file.exists(backup_files)]
+# 
+# if (length(files_to_copy) == 0) {
+#   message("All files are already safely backed up. No action needed.")
+# } else {
+#   file.copy(files_to_copy, backup_dir)
+#   message(length(files_to_copy), " files safely backed up.")
+# }
+
+# ### overwriting and saving files back to flow dir; should be run only once######
+# 
+# baseDir <- "/Users/rgomez/Khor_covidvax_response_IMPACD"
+# original_dir <- "data/counts/flow"
+# 
+# metadata_annotation <- read.csv(
+#   file.path(baseDir, "flow_annotation", "DS_with_annotation_flow.csv"),
+#   stringsAsFactors = FALSE
+# )
+# 
+# timepoint_key <- read.csv(
+#   file.path(baseDir, "flow_annotation", "longitudinalDrawDescription_Timepoint_key.csv"),
+#   stringsAsFactors = FALSE
+# )
+# 
+# files <- list.files(original_dir, pattern = "\\.Rdata$", full.names = TRUE)
+# 
+# for (file in files) {
+# 
+#   message("\nAnnotating: ", file)
+# 
+#   load(file)  # loads "matrices"
+# 
+#   # Check explicitly if sampleName exists
+#   if (!"sampleName" %in% colnames(matrices$design)) {
+#     message("⚠️ Skipping ", file, ": no 'sampleName' column found.")
+#     next  # Skip this file
+#   }
+# 
+#   samples_needing_update <- c(
+#     "exp_D_MN_B06_AL044", "exp_C_CE_B06_AL044", "exp_A_DM_B06_AL044", "exp_B_SP_B06_AL044",
+#     "exp_A_DM_B08_AL065", "exp_B_SP_B08_AL065", "exp_D_MN_B08_AL065", "exp_C_CE_B08_AL065",
+#     "exp_C_CE_B08_AL069", "exp_A_DM_B08_AL069", "exp_B_SP_B08_AL069", "exp_D_MN_B08_AL069",
+#     "exp_C_CE_B17_AL149", "exp_B_SP_B17_AL149", "exp_D_MN_B17_AL149", "exp_A_DM_B17_AL149",
+#     "exp_A_DM_B17_AL158", "exp_B_SP_B17_AL158", "exp_C_CE_B17_AL158", "exp_D_MN_B17_AL158"
+#   )
+# 
+#   update_metadata <- metadata_annotation %>%
+#     filter(sampleName %in% samples_needing_update) %>%
+#     select(sampleName, ageAtDraw, sex, longitudinalDrawDescription, patientType)
+# 
+#   # Metadata updates (only if matching sampleName)
+#   matrices$design <- matrices$design %>%
+#     left_join(update_metadata, by = "sampleName", suffix = c("", ".new")) %>%
+#     mutate(
+#       ageAtDraw = coalesce(ageAtDraw, ageAtDraw.new),
+#       sex = coalesce(sex, sex.new),
+#       longitudinalDrawDescription = coalesce(longitudinalDrawDescription, longitudinalDrawDescription.new),
+#       patientType = coalesce(patientType, patientType.new)
+#     ) %>%
+#     select(-ends_with(".new"))
+# 
+#   # Add new column: timePoint
+#   matrices$design <- matrices$design %>%
+#     left_join(timepoint_key, by = "longitudinalDrawDescription") %>%
+#     rename(timePoint = timePoint)
+# 
+#   # Quick verification
+#   message("Annotations successful for: ", file)
+# 
+#   # Save updated matrices back to original file
+#   save(matrices, file = file)
+# 
+#   message("✅ Annotated and saved to ", file)
+# }
+
+
+
+# #### changing timePoint annotation only for xpb455943418, changing T2 -> T1 and saving files back to flow dir;
+# #### should be done only once
+
+# library(dplyr)
+# 
+# baseDir <- "/Users/rgomez/Khor_covidvax_response_IMPACD"
+# original_dir <- "data/counts/flow"
+# 
+# timepoint_annotation <- read.csv(
+#   file.path(baseDir, "flow_annotation", "DS_with_annotation_flow.csv"),
+#   stringsAsFactors = FALSE
+# )
+# 
+# files <- list.files(original_dir, pattern = "\\.Rdata$", full.names = TRUE)
+# 
+# samples_needing_update <- c(
+#   "exp_C_CE_B09_AL073",
+#   "exp_A_DM_B09_AL073",
+#   "exp_B_SP_B09_AL073"
+# )
+# 
+# for (file in files) {
+# 
+#   message("\nAnnotating: ", file)
+# 
+#   load(file)  # loads "matrices"
+# 
+#   # Check if sampleName exists
+#   if (!"sampleName" %in% colnames(matrices$design)) {
+#     message("⚠️ Skipping ", file, ": no 'sampleName' column found.")
+#     next
+#   }
+# 
+#   # Update timePoint for specified samples
+#   update_timepoints <- timepoint_annotation %>%
+#     filter(sampleName %in% samples_needing_update) %>%
+#     select(sampleName, timePoint)
+# 
+#   # Apply the updates to the matrices
+#   matrices$design <- matrices$design %>%
+#     left_join(update_timepoints, by = "sampleName", suffix = c("", ".updated")) %>%
+#     mutate(timePoint = coalesce(timePoint.updated, timePoint)) %>%
+#     select(-timePoint.updated)
+# 
+#   # Quick verification
+#   message("Annotations successful for: ", file)
+# 
+#   # Save updated matrices back to original file
+#   save(matrices, file = file)
+# 
+#   message("✅ Annotated and saved to ", file)
+# }
+
+
+# source("R/flow_3_analysis_RG_2025_05.R")
+# 
+# # list all R data files  excluding "Bcells_non-PB.Rdata"
+# files <- list.files("data/counts/flow", pattern = "\\.Rdata$", full.names = TRUE)
+# files <- files[basename(files) != "Bcells_non-PB.Rdata"] # explicit exclusion
+# 
+# for (file in files) {
+#   file_base <- tools::file_path_sans_ext(basename(file))
+#   run_DS_vs_TC(file_base)
+# }
+
+####run just one Rdata object; usually for testing
+source("R/flow_4_analysis_RG_2025_09.R")
+#source("R/TFHflow_3_analysis_RG_2025_05.R") # use for super slim populations
+run_DS_vs_TC("naive_CD4_AIMpp")
+
+#### to resume remaining analyses after debugging ########
+
+# source("R/flow_3_analysis_RG_2025_05.R")
+# 
+# # Run analyses for remaining subsets only:
+# for (file_base in to_do) {
+#   
+#   message("🚀 Starting analysis for: ", file_base)
+#   
+#   tryCatch({
+#       run_DS_vs_TC(file_base)
+#     },
+#     error = function(e) {
+#       message("⚠️ Analysis for ", file_base, " failed with error: ", e$message)
+#     }
+#   )
+#   
+#   message("✅ Completed analysis for: ", file_base)
+# }
+
+
+```
+
+# Aging
+```{r run aging analyses}
+source("cytof_functions.R")
+
+# list all R data files in data/counts
+files = list.files("data/counts", pattern = ".Rdata", full.names = T)
+
+
+for (iFile in 1:length(files) ) {
+# for (iFile in 30 ) {
+  file = files[iFile]
+  # extract the name of the file, without the path and extension
+  name = gsub("data/counts/", "", file)
+  name = gsub(".Rdata", "", name)
+  
+  run_age_analysis(name)
+}
+
+```
+

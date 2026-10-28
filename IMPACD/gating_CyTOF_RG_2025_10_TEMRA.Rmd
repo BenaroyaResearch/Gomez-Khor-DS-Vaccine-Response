@@ -1,0 +1,1527 @@
+---
+title: "Covid vax response - Gate validation and IMPACD gating of CyTOF data"
+author: "Rebecca Thee Gomez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---   
+
+```{r set up directories, echo = FALSE, message = FALSE, warning = FALSE}
+baseDir = "/Users/rgomez/Khor_covidvax_response_IMPACD"
+dataDir = file.path(baseDir,'data')
+plotsDir = file.path(baseDir,'plots_RG_2025_05')
+resultsDir = file.path(baseDir, 'results_RG_2025_05')
+tablesDir = file.path(baseDir, 'tables_RG_2025_05')
+fcsDir = file.path(baseDir, "fcs_files_RG_2025_05")
+
+# subdirectories
+rawCountsDir = file.path(dataDir, "raw_counts")
+processedCountsDir = file.path(dataDir, "counts")
+
+dir.create(dataDir, recursive = T, showWarnings = F)
+dir.create(plotsDir, recursive = T, showWarnings = F)
+dir.create(resultsDir, recursive = T, showWarnings = F)
+dir.create(tablesDir, recursive = T, showWarnings = F)
+dir.create(fcsDir, recursive = T, showWarnings = F)
+dir.create(rawCountsDir, recursive = T, showWarnings = F)
+dir.create(processedCountsDir, recursive = T, showWarnings = F)
+```
+
+```{r load libraries, echo = FALSE, message = FALSE, warning = FALSE}
+
+library(tidyverse)
+library(data.table)
+library(knitr)
+library(dplyr)
+library(ggplot2)
+library(ggcyto)
+library(ggpubr)
+library(ggrepel)
+
+library(readxl) # open excels
+library(circlize) # color gradients
+
+library(flowWorkspace)
+library(CytoML)
+library(IMPACD)
+
+library(UpSetR)
+library(tidyverse)
+library(betareg)
+library(limma)
+library(emmeans)
+library(circlize)
+library(ComplexHeatmap)
+library(openxlsx)
+library(VennDiagram)
+```
+
+```{r knitr defaults}
+# opts_chunk$set(fig.width=6, fig.height=4.0, cache = TRUE, echo=FALSE, warning=FALSE, message=FALSE, results='hide')
+opts_chunk$set(fig.width=6, fig.height=5, cache = TRUE, warning=FALSE, message=FALSE, fig.align = 'center')
+
+```
+
+
+# Full CyTOF data
+
+## Validate gate names, coordinates and populations
+
+#### Load workspace and set up design
+```{r load flowJo workspace}
+wsfile = file.path(fcsDir, "Data_Locked_2024-10-10/240529_DS_AllSamples_AEW_BK_Edited_2024-09-26_Counts_AND_GATES.wsp")
+ws = open_flowjo_xml(wsfile)
+
+summary(ws)
+
+gs_flowJo = flowjo_to_gatingset(ws, 
+                                  skip_faulty_gate = TRUE, 
+                                  name = 1,
+                                  path = file.path(fcsDir, "Data_Locked_2024-10-02/All Debarcoded Fcs"))
+
+plot(gs_flowJo)
+
+
+# nodelist = gs_get_pop_paths(gs_flowJo, path = 1)
+nodelist = gs_get_pop_paths(gs_flowJo, path = "full")
+print(nodelist)
+
+```
+
+```{r load the annotations}
+annotations_ = read_excel("/Users/rgomez/Khor_covidvax_response_IMPACD/tables/annotation_cleaned.xlsx", sheet = 1)
+
+# add a column ALid that is "AL" + the number, make sure the number is three digits, with leading zeros if needed
+annotations_$ALId = paste0("AL", formatC(as.numeric(annotations_$Alnumber), width = 3, format = "d", flag = "0"))
+annotations_ = dplyr::select(annotations_, -Alnumber)
+
+annotations_2 = read_excel("/Users/rgomez/Khor_covidvax_response_IMPACD/tables/annotation_cleaned.xlsx", sheet = 2)
+
+setdiff(annotations_2$testId, annotations_$testId)
+
+annotations = merge(annotations_, annotations_2, by = "testId", all.x = TRUE, all.y = TRUE) 
+
+missingAL = dplyr::filter(annotations, is.na(ALId))
+annotations = dplyr::filter(annotations, !is.na(ALId))
+
+# setdiff(annotations$testId, design$testId)
+timePoints = read.csv("/Users/rgomez/Khor_covidvax_response_IMPACD/tables/timePoints.csv", stringsAsFactors = F)
+
+annotations = merge(annotations, timePoints, by = "testId", all.x = TRUE)
+```
+
+```{r create the design matrix}
+fcsFiles = list.files(file.path(fcsDir, "Data_Locked_2024-10-02/All Debarcoded Fcs"), pattern = ".fcs$", full.names = TRUE)
+
+# # remove exp_A_DMSO_only_B07_IC07.fcs from fcsFiles. I think this was created by accident?
+# fcsFiles = fcsFiles[!str_detect(fcsFiles, "exp_A_DMSO_only_B07_IC07.fcs")]
+
+design = data.frame(fcsFiles = fcsFiles)
+
+design$fcsName = basename(design$fcsFiles)
+design$sampleName = gsub(".fcs", "", design$fcsName)
+```
+
+```{r add annotations to the design matrix}
+# extract ALnumber from design$sample_name
+design$testId= gsub(".*xpb([0-9]+).*", "xpb\\1", design$sample)
+
+design$control = str_detect(design$sampleName, "IC")
+design$testId[design$control] = NA
+
+design = merge(design, annotations, by = "testId", all.x = TRUE)
+
+table(design$patientType, design$timePoint)
+table(design$control)
+```
+
+```{r add batch ID to design matrix}
+# add batch ID to design matrix:
+design$batch = as.numeric(gsub(".*B([0-9]+).*", "\\1", design$sampleName))
+table(design$batch)
+
+# sort by batch and then by testId
+design = design[order(design$batch, design$ALId),]
+
+```
+
+### Setup gates
+
+
+```{r try to work through the gating}
+gateList = data.frame(flowJoName = nodelist)
+
+# write to csv so I can open in excel and figure out a pattern
+write.csv(gateList, file = "/Users/rgomez/Khor_covidvax_response_IMPACD/tables_RG_2025_05/CyTOF_gateList.csv", row.names = FALSE)
+
+
+# str split flowJoName by "/" and take the last element
+gateList$node = sapply(strsplit(gateList$flowJoName, "/"), function(x) x[length(x)])
+gateList$parent = sapply(strsplit(gateList$flowJoName, "/"), function(x) paste0(x[1:(length(x) - 1)], collapse = "/"))
+gateList$parent[gateList$parent == ""] = "root"
+
+
+gateList = dplyr::filter(gateList, flowJoName != "/CD16+")
+# cd3+ also seems to be dangling
+gateList = dplyr::filter(gateList, flowJoName != "/CD14-CD19-/CD3+")
+
+gateList = dplyr::filter(gateList, node != "root")
+
+```
+
+
+```{r get gates and transformations}
+# get the controls
+samples = data.frame(flowJoName = sampleNames(gs_flowJo) )
+# remove the _95977 from exp_D_MN_B04_IC04.fcs_95977, etc
+samples$fcsName = gsub(".fcs_.*", ".fcs", samples$flowJoName)
+
+samples = merge(samples, design, by = "fcsName")
+
+table(samples$batch)
+
+samples = samples[order(samples$batch),]
+
+```
+
+```{r generate gate and transformer lists}
+# start building out gates
+
+gates = list()
+trans = list()
+
+
+for (iControl in 1:nrow(samples)) {
+  batch_ = samples$batch[iControl]
+  
+  #Get the gates for this condition and batch
+  gates_ = list()
+  for (i in 1:nrow(gateList)) {
+    gates_[[i]] = gs_pop_get_gate(gs_flowJo, gateList$flowJoName[i])[[iControl]]
+  }
+  gates[[batch_]] = gates_
+  
+  # Get transformations for this condition and batch
+  trans_ = gh_get_transformations(gs_flowJo[[iControl]])
+  trans[[batch_]] <- transformList(from = names(trans_), trans_)
+}
+
+```
+
+
+```{r correctly handling the special gates}
+gates_ = gates[[1]]
+# This time, there are several different types of not gates:
+# - e.g. CD14-CD19- this is not a logical gate, instead this a normal rectangular gate it seems
+gates_[[2]]
+# - e.g. DR+11c+- this is a logical gate, not !DR+11c+. 
+gates_[[3]]
+gates_[[4]]
+# However, notice how it negates the entire "node": !CD14-CD19-/DR+11c+. We will have to change this expression to !DR+11c+
+
+
+
+# Or gates
+gates_[[17]]
+# This is an or gate, unfortunately, it uses expression for the entire note path as well. So we will need to have to fix these as well
+gates_[[30]]
+# We can probably split those gates at the "or" character and then build the expression for them
+
+# One thing that appears to be different to our previous run is that we do not need to add additional negative gates, so that is good!
+
+gateList$dependsOn = NA
+
+gateList = as.data.frame(gateList)
+
+# Approach:
+# Loop over the gates, identify the ones that end in "-", and replace the entire expression with the last element of the path
+for (iGate in 1:nrow(gateList)) {
+  if (!str_detect(gateList$node[iGate], "\\-$")) {next} # skip if doesn't end with -
+  if (class(gates[[1]][[iGate]]) != "booleanFilter") {next} # skip if it is not a logical gate, use the first batch to validate that
+  
+  filterId = gateList$node[iGate]
+  # remove the last character
+  if (str_detect(gateList$node[iGate], "\\+\\-$")) {
+    filterIdpos = substr(filterId, 1, nchar(filterId) - 1)
+  } else {
+    filterIdpos = str_replace(gateList$node[iGate], "\\-$", "+")
+  }
+  
+  # Build the not gate
+  exprs <- paste0("!", filterIdpos)
+  gate_ = eval(substitute(booleanFilter(v, filterId = w), list(v = as.symbol(exprs), w = filterId)))
+  
+  for (iBatch in 1:length(gates)) {
+    gates[[iBatch]][[iGate]] = gate_
+  }
+  
+  
+  # add gates this gates depends 
+  gateList$dependsOn[iGate] = which(gateList$node == filterIdpos & gateList$parent == gateList$parent[iGate])
+  
+}
+
+# Now, fix the or gates:
+for (iGate in 1:nrow(gateList)) {
+  if (!str_detect(gateList$node[iGate], "or")) {next} # skip if doesn't contain key word or
+  if (class(gates[[1]][[iGate]]) != "booleanFilter") {next} # skip if it is not a logical gate
+  
+  filterId = gateList$node[iGate]
+  # remove the last character
+  parents = str_split(filterId, " or ")[[1]]
+  
+  # Build the or gate
+  exprs <- paste0(parents, collapse = "|")
+  gate_ = eval(substitute(booleanFilter(v, filterId = w), list(v = as.symbol(exprs), w = filterId)))
+  
+  for (iBatch in 1:length(gates)) {
+    gates[[iBatch]][[iGate]] = gate_
+  }
+  
+  gateList$dependsOn[iGate] = list(which(gateList$node %in% parents & gateList$parent == gateList$parent[iGate]))
+}
+
+```
+
+
+```{r reset index of gate list}
+# make the rownames clean numeric again, not really needed here since we didn't reinject gates, but 
+rownames(gateList) = NULL
+gateList$idx = 1:nrow(gateList)
+```
+
+
+### Transform fcs and setup validation gating sets
+
+
+```{r transform fcs files}
+fcs_transformed_directory = file.path(fcsDir, "transformed_flow_data", "CyTOF")
+dir.create(fcs_transformed_directory, recursive = T)
+
+design$transformedFcs = file.path(fcs_transformed_directory, design$fcsName)
+
+# The first time I analyze this data set, I am actually loading and transforming the data
+# Everytime we get a new gating set/workspace, we need to transform the fcs files again.
+for (iRow in 1:nrow(design)) {
+  print(iRow)
+  if (file.exists(design$transformedFcs[iRow])) {
+    next
+  }
+  # if (design$batch[iRow] < 15) {next}
+  ff = read.FCS(design$fcsFiles[iRow], truncate_max_range = TRUE)
+  # ff = read.FCS(design$fcs_file[iRow], truncate_max_range = FALSE)
+  ff_t = flowCore::transform(ff, trans[[ design$batch[iRow] ]])
+  
+  write.FCS(ff_t, file = design$transformedFcs[iRow])
+}
+
+```
+
+
+```{r read in the counts from amber}
+# Alice provided us with counts for a few nodes. In contrast to Amber's data, this time we do not
+# have counts for all files nor all gates and we will do our validation on a subset of the data.
+
+countsReference = read_csv("/Users/rgomez/Khor_covidvax_response_IMPACD/tables/CyTOF_validation_hierarchical_gating.csv")
+
+# flowjo added dates to the end of the file names in some cases, let's remove them.
+# remove everything after .fcs in countsReference$sample
+countsReference$sample = gsub("\\.fcs.*", ".fcs", countsReference$sample)
+
+```
+
+```{r setup gating sets}
+# After organizing the gates, we need to organize the fcs files into gating sets
+# instead of making folders and using symboling links (cyto_setup needs a folder to read files in)
+# let's see if we can build the gs objects with flowCore (flowSet() and GatingSet() )
+
+gs = list()
+
+for (batch_ in sort(unique(design$batch))) {
+  samples_ = dplyr::filter(design, batch == batch_)
+  # add a second filtering step to only keep files that amber tested on
+  samples_ = dplyr::filter(samples_, fcsName %in% countsReference$sample)
+  
+  
+  print(paste0(" batch: ", batch_, " samples: ", nrow(samples_)))
+  flowSet = read.flowSet(samples_$transformedFcs,
+                         truncate_max_range = FALSE)
+  
+  gs[[batch_]] = GatingSet(flowSet)
+}
+```
+
+### Do gating
+```{r come up with what we need to gate}
+# after reexport of the cytof data, alice added multiple new paths
+# these are the ones we want to gate for:
+# CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT-/TCRgd-/CD4+/Treg-/RA+/Q1: 155Gd_CD62L- , 167Er_CD27+ or Q2: 155Gd_CD62L+ , 167Er_CD27+/Tscm
+# CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT-/TCRgd-/CD8+/RA+-/Q2: 155Gd_CD62L+ , 167Er_CD27+
+# CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT-/TCRgd-/CD8+/RA+/Q1: 155Gd_CD62L- , 167Er_CD27+ or Q2: 155Gd_CD62L+ , 167Er_CD27+/Tscm
+# /CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT-/TCRgd-/CD4+/Treg-/RA+-/Q2: 155Gd_CD62L+ , 167Er_CD27+
+# If we gate for these nodes, we should also cover all the other nodes that alice exported as they are part of those paths
+
+paths = list()
+paths[[1]] = as.vector(str_split("CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT-/TCRgd-/CD4+/Treg-/RA+/Q1: 155Gd_CD62L- , 167Er_CD27+ or Q2: 155Gd_CD62L+ , 167Er_CD27+/Tscm", "/", simplify = TRUE))
+paths[[2]] = as.vector(str_split("CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT-/TCRgd-/CD8+/RA+-/Q2: 155Gd_CD62L+ , 167Er_CD27+", "/", simplify = TRUE))
+paths[[3]] = as.vector(str_split("CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT-/TCRgd-/CD8+/RA+/Q1: 155Gd_CD62L- , 167Er_CD27+ or Q2: 155Gd_CD62L+ , 167Er_CD27+/Tscm", "/", simplify = TRUE))
+paths[[4]] = as.vector(str_split("CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT-/TCRgd-/CD4+/Treg-/RA+-/Q2: 155Gd_CD62L+ , 167Er_CD27+", "/", simplify = TRUE))
+
+
+# Instead of splitting it up and gating shared features first, I am going to implement a check to see if the gate to be added already exists, and then will skip it
+
+```
+
+
+```{r gate all the gates amber gave us}
+# this is a bit different than in previous iterations - now, instead of going by "hierarchical" and 
+# "leafs" I am going to just step through sequentially
+
+# Let's add celltype so we can distinguish ambiguous gates
+gateList$cellType = ifelse(str_detect(gateList$flowJoName, "CD4"), "CD4", 
+                           ifelse(str_detect(gateList$flowJoName, "CD8"), "CD8", NA))
+
+# Also add RA information
+gateList$RA = ifelse(str_detect(gateList$flowJoName, "RA\\+-"), "RA+-", 
+                     ifelse(str_detect(gateList$flowJoName, "RA\\+(?!-)"), "RA+", NA))
+
+
+add_new_node_workspace = function(gs, node, gate, parent) {
+  if (parent == "root") {
+    nodeToAdd = paste0("/", node)
+  } else {
+    nodeToAdd = paste0(parent, "/", node)
+  }
+  
+  existingNodes = gs_get_pop_paths(gs, path = "full")
+
+  if (nodeToAdd %in% existingNodes) {return (nodeToAdd)}
+
+  gs_pop_add(gs, gate, parent = parent)
+
+  return(nodeToAdd)
+}
+
+# RA/cellType/parent-aware resolver to pick the correct gate index
+.pick_node_idx <- function(nm, parent_path, gateList, prev_idx = NA_integer_) {
+  cand <- which(gateList$node == nm)
+  if (length(cand) == 0) return(NA_integer_)
+  if (length(cand) == 1) return(cand)
+
+  # Derive contextual hints from parent_path
+  cellType_ <- ifelse(str_detect(parent_path, "CD4"), "CD4",
+               ifelse(str_detect(parent_path, "CD8"), "CD8", NA))
+  RA_ <- ifelse(str_detect(parent_path, "RA\\+-"), "RA+-",
+         ifelse(str_detect(parent_path, "RA\\+(?!-)"), "RA+", NA))
+
+  if (!is.na(cellType_)) cand <- cand[gateList$cellType[cand] == cellType_]
+  if (length(cand) == 1) return(cand)
+
+  if (!is.na(RA_))       cand <- cand[gateList$RA[cand] == RA_]
+  if (length(cand) == 1) return(cand)
+
+  # Prefer a candidate that lists prev_idx in dependsOn
+  if (!is.na(prev_idx)) {
+    dep_hits <- vapply(cand, function(i) {
+      di <- gateList$dependsOn[[i]]
+      if (is.null(di)) return(FALSE)
+      if (is.character(di)) return(FALSE)
+      prev_idx %in% unlist(di, use.names = FALSE)
+    }, logical(1))
+    if (sum(dep_hits) >= 1) return(cand[which(dep_hits)][1])
+  }
+
+  # Last resort: prefer exact parent match if available
+  ph <- which(gateList$parent[cand] == parent_path)
+  if (length(ph) >= 1) return(cand[ph[1]])
+
+  # Deterministic fallback
+  cand[1]
+}
+
+
+# gate the shared path (using resolver + prev_idx to avoid RA/duplicate mixups)
+for (iPath in seq_along(paths)) {
+  for (batch_ in unique(design$batch)) {
+    parent   = "root"
+    prev_idx = NA_integer_
+    
+    for (i in seq_along(paths[[iPath]])) {
+      nm <- paths[[iPath]][i]
+      
+      # Resolve the correct gate row for this node given current parent context
+      iGate <- .pick_node_idx(nm, parent, gateList, prev_idx)
+      if (is.na(iGate)) {
+        stop(paste0("Could not resolve gate for node '", nm, "' under parent '", parent, "'"))
+      }
+      
+      # Add any declared dependencies first (do NOT advance parent on deps)
+      if (!is.na(gateList$dependsOn[iGate])) {
+        additionalGates <- unlist(gateList$dependsOn[iGate])
+        for (dep in additionalGates) {
+          if (is.character(dep)) {
+            dep_idx <- .pick_node_idx(dep, parent, gateList, prev_idx)
+            if (is.na(dep_idx)) stop(paste0("Dependency '", dep, "' could not be resolved under parent '", parent, "'"))
+          } else {
+            dep_idx <- gateList$idx[dep]
+          }
+          # Add dependency node under the current parent (parent remains unchanged)
+          add_new_node_workspace(gs[[batch_]], gateList$node[dep_idx], gates[[batch_]][[dep_idx]], parent)
+          # We update prev_idx to the last successfully added gate index to help future disambiguation
+          prev_idx <- dep_idx
+        }
+      }
+      
+      # Now add the actual node
+      idx    <- gateList$idx[iGate]
+      parent <- add_new_node_workspace(gs[[batch_]], gateList$node[iGate], gates[[batch_]][[idx]], parent)
+      prev_idx <- idx
+    }
+  }
+}
+
+```
+
+```{r summarize event counts}
+pop_counts = c()
+
+for (batch_ in unique(design$batch)) {
+  recompute(gs[[batch_]])
+  
+  pop_counts = rbind(pop_counts, 
+                     gs_pop_get_count_fast(gs[[batch_]], format = "long")
+                     )
+}
+
+save(pop_counts, file = "/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/CyTOF/CyTOF_pop_counts_hierarchical_gating.Rdata")
+```
+
+
+### Validation with FlowJO counts
+```{r compare the results to Ambers counts}
+
+
+merged_pop_counts_ = dplyr::select(pop_counts, fcsName = name, population = Population, countR = Count)
+
+countsReferenceLong = countsReference %>% 
+  pivot_longer(-sample, names_to = "population", values_to = "countFlowJo")
+
+countsReferenceLong = dplyr::select(countsReferenceLong, fcsName = sample, population, countFlowJo = countFlowJo)
+
+# ambers counts are missing the leading /
+symdiff(countsReferenceLong$population, merged_pop_counts_$population)
+
+countsReferenceLong$population = paste0("/", countsReferenceLong$population)
+
+# now we should only have "/Count" missing. this would be equal to our "root"
+# and also the PB+ gate (which Amber did not write out)
+symdiff(countsReferenceLong$population, merged_pop_counts_$population)
+
+
+merged_pop_counts = left_join(merged_pop_counts_, countsReferenceLong, by = c("fcsName", "population"))
+
+# removing amber counts with NA, will remove the PB+ nodes
+merged_pop_counts = dplyr::filter(merged_pop_counts, !is.na(countFlowJo))
+
+unique(merged_pop_counts$population)
+
+merged_pop_counts = merge(merged_pop_counts, design, by = "fcsName")
+
+
+# find the populations Alice has that I am missing
+setdiff(unique(countsReferenceLong$population), unique(merged_pop_counts$population))
+
+```
+
+```{r visualize results}
+merged_pop_counts$delta = merged_pop_counts$countR - merged_pop_counts$countFlowJo
+
+ggplot(merged_pop_counts, aes(x = countR, y = countFlowJo, color = as.factor(batch)) ) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey") +
+  facet_wrap(~population, scales = "free") +
+  theme_bw() +
+  # reduce fontsize
+  # theme(text = element_text(size = 8)) +
+  labs(x = "counts R", y = "counts flowJo", color = "batch") +
+  theme(legend.position = "right")
+
+# The first pass, I noticed that the logical gate appears to be off
+
+
+ggsave("/Users/rgomez/Khor_covidvax_response_IMPACD/plots_RG_2025_05/CyTOF/validation/hierarchical.pdf", width = 22, height = 15, units = "in")
+ggsave("/Users/rgomez/Khor_covidvax_response_IMPACD/plots_RG_2025_05/CyTOF/validation/hierarchical.png", width = 22, height = 15, units = "in")
+
+```
+
+
+```{r exploring the differences}
+# Tracking down mismatches we had during the second pass - turns out nodes following RA+- and RA+ were mixed up:
+# /CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT-/TCRgd-/CD8+/RA+-/Q2: 155Gd_CD62L+ , 167Er_CD27+ used the Q2: 155Gd_CD62L+ , 167Er_CD27+ gate for RA+
+# sus = dplyr::filter(merged_pop_counts, abs(delta) > 100)
+# 
+# # make the same plot, but add the batch Id to points for which abs(delta) > 100
+# ggplot(dplyr::filter(merged_pop_counts, population %in% sus$population), aes(x = countR, y = countFlowJo, color = as.factor(batch), label = ifelse(abs(delta) > 100, as.character(batch), "")) ) +
+#   geom_point() +
+#   geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey") +
+#   geom_text_repel() +
+#   facet_wrap(~population, scales = "free") +
+#   theme_bw() +
+#   # reduce fontsize
+#   # theme(text = element_text(size = 8)) +
+#   labs(x = "counts R", y = "counts flowJo", color = "batch") + 
+#   # dont show legend
+#   theme(legend.position = "right")
+# 
+# 
+# ggsave("plots/CyTOF/validation/hierarchical_mismatches.pdf", width = 16, height = 10, units = "in")
+# ggsave("plots/CyTOF/validation/hierarchical_mismatches.png", width = 16, height = 10, units = "in")
+# This time, 	
+# /CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT-/TCRgd-/CD8+/RA+-/Q2: 155Gd_CD62L+ , 167Er_CD27+
+# seems to be off
+```
+
+
+```{r plot-q2-diagnostic, eval=FALSE}
+
+# Code that was used the first time I noticed differences between flowJo exports and my  counts
+# Turned out in the end, that it was a problem with the flowJo export.
+# # Alice went back and reexported everything and added additionals nodes
+# batch_ = 18
+# gateId = which(gateList$node == "Q2: 155Gd_CD62L+ , 167Er_CD27+" & gateList$cellType == "CD8")
+# gateId
+# # [1] 32 37
+# 
+# # we find two gates, this makes me think that we the issue could be from us using the RA+ gate version instead of the RA+- gate version of "Q2: 155Gd_CD62L+ , 167Er_CD27+"
+# 
+# 
+# thisGate <- gates[[batch_]][[gateId[1]]]
+# lights  <- names(thisGate@parameters)  # x/y channel names
+# 
+# # Prefer a single GatingHierarchy for plotting
+# gh <- gs[[batch_]][[1]]
+# 
+# p <- ggcyto(gh,
+#             aes(!!rlang::sym(lights[1]), !!rlang::sym(lights[2])),
+#             subset = "/CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT-/TCRgd-/CD8+/RA+-/") +
+#   geom_hex(bins = 64) +
+#   geom_gate(thisGate, colour = "red") +
+#   geom_gate(gates[[batch_]][[gateId[2]]], colour = "purple") +
+#   ggcyto_par_set(limits = "data") +
+#   geom_stats(type = "count")
+# 
+# print(p)
+
+# The purple gate is bigger. This makes me think we are using the red gate, which would explain why we are capturing fewer cells than we should.
+
+```
+
+```{r plot the bad gate}
+# Code that was used the first time I noticed differences between flowJo exports and my  counts
+# Turned out in the end, that it was a problem with the flowJo export.
+# # Alice went back and reexported everything and added additionals nodes
+# batch_ = 13
+# gateId = 16
+# 
+# thisGate = gates[[batch_]][[gateId]]
+# lights = names(thisGate@parameters)
+# 
+# ggcyto(gs[[batch_]][1], aes_string(lights[1],lights[2]), subset = "/CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT-/TCRgd-/CD4+/Treg-/RA+") +
+#   geom_hex(bins = 64)  + geom_gate(thisGate, col = "red") + geom_gate(gates[[batch_]][[19]], col = "green") +
+#     ggcyto_par_set(limits = "data") + geom_stats(type = "count")
+# 
+# ggcyto(gs_flowJo[[batch_]] , aes_string(lights[1],lights[2]), subset = "/CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT-/TCRgd-/CD4+/Treg-/RA+") +
+#  geom_hex(bins = 64)  + geom_gate(thisGate, col = "blue") + geom_gate(gates[[batch_]][[19]], col = "purple") +
+#   ggcyto_par_set(limits = "data") + geom_stats(type = "count")
+# 
+# 
+# # They look more or less identical to me!
+# x = dplyr::filter(merged_pop_counts, batch == batch_)
+
+# recompute(gs_flowJo[[batch_]])
+# flowJoCounts =   gs_pop_get_count_fast(gs_flowJo[[batch_]], format = "long")
+
+```
+
+## Modifiers gating
+
+### Validate gate names, coordinates and populations
+
+#### Load workspace and set up design
+```{r load flowJo workspace}
+wsfile = file.path(fcsDir, "Data_Locked_2024-10-02/240530_DS_BatchICs_SingleGatesOnly.wsp")
+ws = open_flowjo_xml(wsfile)
+
+summary(ws)
+
+gs_flowJo = flowjo_to_gatingset(ws, 
+                                  skip_faulty_gate = TRUE, 
+                                  name = 1,
+                                  path = file.path(fcsDir, "Data_Locked_2024-10-02/All Debarcoded Fcs"))
+
+plot(gs_flowJo)
+
+
+# nodelist = gs_get_pop_paths(gs_flowJo, path = 1)
+nodelistModifiers = gs_get_pop_paths(gs_flowJo, path = "full")
+print(nodelistModifiers)
+
+```
+
+### Setup gates
+
+
+```{r try to work through the gating}
+gateList$type = "hierarchical"
+
+gateListModifiers = data.frame(flowJoName = nodelistModifiers)
+
+
+
+# str split flowJoName by "/" and take the last element
+gateListModifiers$node = sapply(strsplit(gateListModifiers$flowJoName, "/"), function(x) x[length(x)])
+gateListModifiers$parent = "root"
+
+gateListModifiers = dplyr::filter(gateListModifiers, node != "root")
+
+```
+
+
+```{r get gates and transformations}
+# get the controls
+samples = data.frame(flowJoName = sampleNames(gs_flowJo) )
+# remove the _95977 from exp_D_MN_B04_IC04.fcs_95977, etc
+samples$fcsName = gsub(".fcs_.*", ".fcs", samples$flowJoName)
+
+samples = merge(samples, design, by = "fcsName")
+
+table(samples$batch)
+
+samples = samples[order(samples$batch),]
+
+```
+
+```{r generate gate and transformer lists}
+# start building out gates
+
+# IMPORTANT: the first time I ran the evaluation I had issues with the not gates. I will correctly handle them in the next section. HOWEVER - the big problem is how they are coming out of the workspace, eg. NKT in the gating paths should actually be NKT- and the gate that has filterId NKT is actually NKT+! So I am going to have to fix the gate names in the gating objects, but more importantly, we will have to replace all the NKTs in paths to NKT-. And it gets even worse TCRgd+ in the gating paths is actually TCRgd- and the gate that has filterId TCRgd+ is actually TCRgd+! So I will have to fix that as well. 
+
+gatesModifiers = list()
+transModifiers = list()
+
+
+for (iControl in 1:nrow(samples)) {
+  batch_ = samples$batch[iControl]
+  
+  #Get the gates for this condition and batch
+  gates_ = list()
+  for (i in 1:nrow(gateListModifiers)) {
+    gates_[[i]] = gs_pop_get_gate(gs_flowJo, gateListModifiers$flowJoName[i])[[iControl]]
+  }
+  gatesModifiers[[batch_]] = gates_
+  
+  # Get transformations for this condition and batch
+  trans_ = gh_get_transformations(gs_flowJo[[iControl]])
+  transModifiers[[batch_]] <- transformList(from = names(trans_), trans_)
+}
+
+```
+
+
+```{r correctly handling the special gates}
+gates_ = gatesModifiers[[1]]
+
+gates_
+# All gates are rectangular gates, so nothing to do here for now 
+
+
+gateListModifiers$dependsOn = NA
+
+rownames(gateListModifiers) = NULL
+gateListModifiers$idx = 1:nrow(gateListModifiers)
+```
+
+
+### Transform fcs and setup validation gating sets
+
+
+```{r read in the counts from amber}
+# Alice provided us with counts for a few nodes. In contrast to Amber's data, this time we do not
+# have counts for all files nor all gates and we will do our validation on a subset of the data.
+
+countsReference = read_csv("/Users/rgomez/Khor_covidvax_response_IMPACD/tables/CyTOF_validation_modifiers.csv")
+
+# flowjo added dates to the end of the file names in some cases, let's remove them.
+# remove everything after .fcs in countsReference$sample
+countsReference$sample = gsub("\\.fcs.*", ".fcs", countsReference$sample)
+
+```
+
+```{r setup gating sets}
+# After organizing the gates, we need to organize the fcs files into gating sets
+# instead of making folders and using symboling links (cyto_setup needs a folder to read files in)
+# let's see if we can build the gs objects with flowCore (flowSet() and GatingSet() )
+
+gs = list()
+
+for (batch_ in sort(unique(design$batch))) {
+  samples_ = dplyr::filter(design, batch == batch_)
+  # add a second filtering step to only keep files that amber tested on
+  samples_ = dplyr::filter(samples_, fcsName %in% countsReference$sample)
+  
+  
+  print(paste0(" batch: ", batch_, " samples: ", nrow(samples_)))
+  flowSet = read.flowSet(samples_$transformedFcs,
+                         truncate_max_range = FALSE)
+  
+  gs[[batch_]] = GatingSet(flowSet)
+}
+```
+
+### Do gating
+
+
+```{r gate all the gates amber gave us}
+# this is a bit different than in previous iterations - now, instead of going by "hierarchical" and 
+# "leafs" I am going to just step through sequentially
+
+
+# gate the shared path
+for (batch_ in unique(design$batch)) {
+  parent = "root"
+  for (i in 1:nrow(gateListModifiers) ) {
+
+    idx = gateListModifiers$idx[i]
+    gs_pop_add(gs[[batch_]], gatesModifiers[[batch_]][[idx]], parent = parent)
+  }
+}
+```
+
+
+```{r count pops}
+pop_counts = c()
+
+for (batch_ in unique(design$batch)) {
+  recompute(gs[[batch_]])
+  
+  pop_counts = rbind(pop_counts, 
+                     gs_pop_get_count_fast(gs[[batch_]], format = "long")
+                     )
+}
+
+save(pop_counts, file = "/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/CyTOF/CyTOF_pop_counts_single_gates_gating.Rdata")
+```
+
+
+### Validation with FlowJO counts
+```{r compare the results to Ambers counts}
+
+merged_pop_counts_ = dplyr::select(pop_counts, fcsName = name, population = Population, countR = Count)
+
+countsReference = countsReference %>% 
+  pivot_longer(-sample, names_to = "population", values_to = "countFlowJo")
+
+countsReference = dplyr::select(countsReference, fcsName = sample, population, countFlowJo = countFlowJo)
+
+# flowJo counts are missing the leading /
+symdiff(countsReference$population, merged_pop_counts_$population)
+
+countsReference$population = paste0("/", countsReference$population)
+
+# now we should have all the counts
+symdiff(countsReference$population, merged_pop_counts_$population)
+
+merged_pop_counts = left_join(merged_pop_counts_, countsReference, by = c("fcsName", "population"))
+
+# removing amber counts with NA, will remove the PB+ nodes
+merged_pop_counts = dplyr::filter(merged_pop_counts, !is.na(countFlowJo))
+
+unique(merged_pop_counts$population)
+
+merged_pop_counts = merge(merged_pop_counts, design, by = "fcsName")
+
+# remove leading / from population
+merged_pop_counts$population = gsub("^/", "", merged_pop_counts$population)
+unique(merged_pop_counts$population)
+
+```
+
+```{r visualize results}
+merged_pop_counts$delta = merged_pop_counts$countR - merged_pop_counts$countFlowJo
+
+ggplot(merged_pop_counts, aes(x = countR, y = countFlowJo, color = as.factor(batch)) ) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey") +
+  facet_wrap(~population, scales = "free") +
+  theme_bw() +
+  # reduce fontsize
+  # theme(text = element_text(size = 8)) +
+  labs(x = "counts R", y = "counts flowJo", color = "batch", title = "Validation of single gates") +
+  theme(legend.position = "right")
+
+# The first pass, I noticed that the logical gate appears to be off
+
+
+ggsave("/Users/rgomez/Khor_covidvax_response_IMPACD/plots_RG_2025_05/CyTOF/validation/single_gates.pdf", width = 15, height = 10, units = "in")
+ggsave("/Users/rgomez/Khor_covidvax_response_IMPACD/plots_RG_2025_05/CyTOF/validation/single_gates.png", width = 15, height = 10, units = "in")
+
+```
+
+# IMPACD
+
+## Determine roots and add missing gates
+
+```{r setting up the roots}
+cellTypesTopLevel = c(
+  "Bcells" =	"CD19+",
+  "CD4Teff" =	 "CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT-/TCRgd-/CD4+/Treg-",
+  "CD4TFH" = "CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT-/TCRgd-/CD4+/Treg-/CXCR5+",
+  "CD4Treg" =	"CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT-/TCRgd-/CD4+/Treg+",
+  "CD8Teff"	= "CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT-/TCRgd-/CD8+",
+  "NKT"	= "CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT+",
+  "NK" = "CD14-CD19-/DR+11c+-/pDC-/CD56+ NK",
+  "pDC" = "CD14-CD19-/DR+11c+/pDC+"
+)
+
+TcellRootsMemory = c(
+  "TrueNaive"      = "RA+/Q1: 155Gd_CD62L- , 167Er_CD27+ or Q2: 155Gd_CD62L+ , 167Er_CD27+/Tscm-",
+  "StemCellMemory" = "RA+/Q1: 155Gd_CD62L- , 167Er_CD27+ or Q2: 155Gd_CD62L+ , 167Er_CD27+/Tscm",
+  # FIXED: CentralMemory must be RA+-/Q2+
+  "CentralMemory"  = "RA+-/Q2: 155Gd_CD62L+ , 167Er_CD27+",
+  "EffectorMemory" = "RA+-/NOT Q2: 155Gd_CD62L+ , 167Er_CD27+",
+  # FIXED: TEMRA as RA+ / NOT (Q1 or Q2)  (uses boolean NOT w/ OR we add below)
+  "TEMRA"          = "RA+/NOT Q1: 155Gd_CD62L- , 167Er_CD27+ or Q2: 155Gd_CD62L+ , 167Er_CD27+",
+  "TotalMemory"    = "RA+-"
+)
+
+  
+TcellRootsTh = c(
+  "Th1"	= "CXCR3+/CCR6-",
+  "Th2"	= "CXCR3-/CCR6-/CCR4+",
+  "Th17"	= "CXCR3-/CCR6+",
+  "Th1_17"	= "CXCR3+/CCR6+"
+)
+
+TcellRootsCD8 = c(
+  "TPEX" = "Q2: 155Gd_CD62L+ , 167Er_CD27+/Tscm/PD1+/TIGIT+", # Use the RA+- version of the gates
+  "Tstem" = "Q2: 155Gd_CD62L+ , 167Er_CD27+/Tscm/PD1-/TIGIT-" # Use the RA+- version of the gates
+
+)
+
+BcellRoots = c(
+  "PB" = "PB+",
+  "non-PB/naive" = "PB-/Naive",
+  "non-PB/NonSwitchedMemory" = "PB-/NSWM",
+  "non-PB/SwitchedMemory" =  "PB-/SWM",
+  "non-PB/DN" = "CD19+/PB-/DN B"
+)
+
+NKTRoots = c(
+"CD4SP"	= "CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT+/CD4+",
+"CD8SP" =	"CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT+/CD8+",
+"CD4CD8DN"	= "CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT+/CD4-/CD8-",
+"CD16neg"	= "CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT+/CD16-",
+"CD16pos"	= "CD14-CD19-/DR+11c+-/pDC-/CD3+/NKT+/CD16+"
+)
+
+```
+
+
+```{r prep for IMPACD}
+# gateListHierarchy = gateList
+# gateList = gateListHierarchy
+gateListModifiers$cellType = NA
+gateListModifiers$RA = NA
+gateListModifiers$type = "modifier"
+gateListModifiers$idx = gateListModifiers$idx + nrow(gateList)
+
+gateListAll = rbind(gateList, gateListModifiers)
+
+gatesAll = list()
+for (iBatch in 1:length(gates)) {
+  gatesAll[[iBatch]] = c(gates[[iBatch]], gatesModifiers[[iBatch]])
+}
+
+#spot check
+iGate = 30
+gateListAll[iGate, c("node", "idx")]
+gatesAll[[10]][[iGate]]
+
+iGate = 90
+gateListAll[iGate, c("node", "idx")]
+gatesAll[[12]][[iGate]]
+
+iGate = 76
+gateListAll[iGate, c("node", "idx")]
+gatesAll[[1]][[iGate]]
+# okay, order and idx are good
+
+# find all unique gates we are using in the root paths, and find the missing ones that we sill need to create
+allRootPathGates = c(cellTypesTopLevel, TcellRootsMemory, TcellRootsTh, TcellRootsCD8, BcellRoots, NKTRoots)
+allRootPathGates = unique(str_split(paste0(allRootPathGates, collapse = "/"), "/")[[1]])
+
+missingGates = allRootPathGates[!allRootPathGates %in% gateListAll$node]
+missingGates
+
+# I double checked with my excel spreadsheet and there I got the same 9 gates that need to be created
+```
+
+
+```{r create additional gates}
+# All gates are either just the boolean version of the + version of the gate, and one bigger NOT gate, so I can simplify things a bit compared to what I did for the hierarchical gating when I fixed the boolean gates
+
+# Build any gates missing from FlowJo to satisfy root vocab
+for (iGate in seq_along(missingGates)) {
+  filterId <- missingGates[iGate]
+
+  # Helper: resolve a node label to "dependsOn" (leave as character labels so
+  # getRootPathTcells can RA-resolve at runtime)
+  as_dep <- function(lbls) {
+    if (is.character(lbls)) return(lbls)
+    return(lbls)
+  }
+
+  # CASE 1: "NOT <something>"
+  if (str_detect(filterId, "^NOT ")) {
+    pos <- str_replace(filterId, "^NOT ", "")
+
+    #    # 1a) NOT (A or B or C...)  ->  (!A) & (!B) & (!C)
+    if (str_detect(pos, " or ")) {
+      parts <- str_split(pos, " or ", simplify = TRUE)[1, ]
+      # Build as conjunction of individual NOTs to avoid '(' tokens
+      exprs <- paste(paste0("!", parts), collapse = "&")
+      gate_ <- eval(substitute(booleanFilter(v, filterId = w),
+                               list(v = as.symbol(exprs), w = filterId)))
+      # Append to all batches
+      for (iBatch in seq_along(gatesAll)) {
+        gatesAll[[iBatch]][[length(gatesAll[[iBatch]]) + 1]] <- gate_
+      }
+      # Register in gateListAll
+      newGate <- data.frame(node = filterId, idx = nrow(gateListAll) + 1,
+                            dependsOn = NA, type = "boolean")
+      gateListAll <- bind_rows(gateListAll, newGate)
+      gateListAll$dependsOn[[nrow(gateListAll)]] <- parts  # depend on raw part labels
+      next
+    }
+
+
+    # 1b) Simple NOT X  (existing behavior)
+    filterIdpos <- pos
+    exprs <- paste0("!", filterIdpos)
+    gate_ <- eval(substitute(booleanFilter(v, filterId = w),
+                             list(v = as.symbol(exprs), w = filterId)))
+    for (iBatch in seq_along(gatesAll)) {
+      gatesAll[[iBatch]][[length(gatesAll[[iBatch]]) + 1]] <- gate_
+    }
+    newGate <- data.frame(node = filterId, idx = nrow(gateListAll) + 1,
+                          dependsOn = NA, type = "boolean")
+    gateListAll <- bind_rows(gateListAll, newGate)
+    gateListAll$dependsOn[[nrow(gateListAll)]] <- as_dep(filterIdpos)
+    next
+  }
+
+  # CASE 2: trailing "-" (boolean inversion of a "+" or a bare marker)
+  if (str_detect(filterId, "\\-$")) {
+    filterIdpos <- if (str_detect(filterId, "\\+\\-$")) {
+      substr(filterId, 1, nchar(filterId) - 1)
+    } else {
+      str_replace(filterId, "\\-$", "+")
+    }
+    # If the "+” version truly doesn't exist (e.g., Tscm-), invert the bare token
+    if (!(filterIdpos %in% gateListAll$node)) {
+      filterIdpos <- str_replace(filterId, "\\-$", "")
+    }
+    gate_ <- eval(substitute(booleanFilter(v, filterId = w),
+                             list(v = as.symbol(paste0("!", filterIdpos)), w = filterId)))
+    for (iBatch in seq_along(gatesAll)) {
+      gatesAll[[iBatch]][[length(gatesAll[[iBatch]]) + 1]] <- gate_
+    }
+    newGate <- data.frame(node = filterId, idx = nrow(gateListAll) + 1,
+                          dependsOn = NA, type = "boolean")
+    gateListAll <- bind_rows(gateListAll, newGate)
+    gateListAll$dependsOn[[nrow(gateListAll)]] <- as_dep(filterIdpos)
+    next
+  }
+
+  # CASE 3: plain "A or B" (rare in roots now, but supported)
+  if (str_detect(filterId, " or ")) {
+    parts <- str_split(filterId, " or ", simplify = TRUE)[1, ]
+    exprs <- paste(parts, collapse = "|")
+    gate_ <- eval(substitute(booleanFilter(v, filterId = w),
+                             list(v = as.symbol(exprs), w = filterId)))
+    for (iBatch in seq_along(gatesAll)) {
+      gatesAll[[iBatch]][[length(gatesAll[[iBatch]]) + 1]] <- gate_
+    }
+    newGate <- data.frame(node = filterId, idx = nrow(gateListAll) + 1,
+                          dependsOn = NA, type = "boolean")
+    gateListAll <- bind_rows(gateListAll, newGate)
+    gateListAll$dependsOn[[nrow(gateListAll)]] <- as_dep(parts)
+    next
+  }
+
+  # (No other synthetic shapes are supported—FlowJo must supply rectangle gates.)
+}
+
+# Recompute what's still missing (should be character(0) ideally)
+missingGates <- allRootPathGates[!allRootPathGates %in% gateListAll$node]
+missingGates
+
+#spot check
+iGate = 91
+gateListAll[iGate, c("node", "idx")]
+gatesAll[[10]][[iGate]]
+
+iGate = 92
+gateListAll[iGate, c("node", "idx")]
+gatesAll[[12]][[iGate]]
+
+iGate = 93
+gateListAll[iGate, c("node", "idx")]
+gatesAll[[1]][[iGate]]
+
+iGate = nrow(gateListAll)
+gateListAll[iGate, c("node", "idx")]
+gatesAll[[1]][[iGate]]
+
+```
+
+
+```{r come up with all the root paths to gate for}
+completeRootPaths = c()
+
+names(cellTypesTopLevel)
+
+# Top level
+completeRootPaths_ = cellTypesTopLevel
+names(completeRootPaths_) = names(cellTypesTopLevel)
+
+completeRootPaths = c(completeRootPaths, completeRootPaths_)
+
+# Bcells
+completeRootPaths_ = paste(cellTypesTopLevel["Bcells"], BcellRoots, sep = "/")
+names(completeRootPaths_) = paste0("Bcells/", names(BcellRoots))
+
+completeRootPaths = c(completeRootPaths, completeRootPaths_)
+
+
+# CD4Teff
+
+completeRootPaths_ = paste(cellTypesTopLevel["CD4Teff"], TcellRootsTh, sep = "/")
+names(completeRootPaths_) = paste0("CD4Teff/", names(TcellRootsTh))
+
+completeRootPaths = c(completeRootPaths, completeRootPaths_)
+
+completeRootPaths_ = paste(cellTypesTopLevel["CD4Teff"], TcellRootsMemory, sep = "/")
+names(completeRootPaths_) = paste0("CD4Teff/", names(TcellRootsMemory))
+
+completeRootPaths = c(completeRootPaths, completeRootPaths_)
+
+# add the Th paths to CD4Teff
+addThTo = completeRootPaths_[str_detect(names(completeRootPaths_), "Memory|TEMRA")]
+for (iPath in 1:length(addThTo)) {
+  completeRootPaths_ = paste(addThTo[iPath], TcellRootsTh, sep = "/")
+  names(completeRootPaths_) = paste0(names(addThTo)[iPath], "/", names(TcellRootsTh))
+  
+  completeRootPaths = c(completeRootPaths, completeRootPaths_)
+}
+
+
+# CD4TFH
+completeRootPaths_ = paste(cellTypesTopLevel["CD4TFH"], TcellRootsMemory, sep = "/")
+names(completeRootPaths_) = paste0("CD4TFH/", names(TcellRootsMemory))
+
+completeRootPaths = c(completeRootPaths, completeRootPaths_)
+
+# add the Th paths to CD4TFH
+addThTo = completeRootPaths_[str_detect(names(completeRootPaths_), "Memory|TEMRA")]
+for (iPath in 1:length(addThTo)) {
+  completeRootPaths_ = paste(addThTo[iPath], TcellRootsTh, sep = "/")
+  names(completeRootPaths_) = paste0(names(addThTo)[iPath], "/", names(TcellRootsTh))
+  
+  completeRootPaths = c(completeRootPaths, completeRootPaths_)
+}
+
+# CD4Treg
+completeRootPaths_ = paste(cellTypesTopLevel["CD4Treg"], TcellRootsMemory, sep = "/")
+names(completeRootPaths_) = paste0("CD4Treg/", names(TcellRootsMemory))
+
+completeRootPaths = c(completeRootPaths, completeRootPaths_)
+
+# CD8Teff
+completeRootPaths_ = paste(cellTypesTopLevel["CD8Teff"], c(TcellRootsMemory, TcellRootsCD8), sep = "/")
+names(completeRootPaths_) = paste0("CD8Teff/", names(c(TcellRootsMemory, TcellRootsCD8)))
+
+completeRootPaths = c(completeRootPaths, completeRootPaths_)
+
+# NKT
+completeRootPaths_ = paste(cellTypesTopLevel["NKT"], NKTRoots, sep = "/")
+names(completeRootPaths_) = paste0("NKT/", names(NKTRoots))
+
+completeRootPaths = c(completeRootPaths, completeRootPaths_)
+
+names(completeRootPaths)
+
+
+rootPaths = data.frame(name = names(completeRootPaths), path = completeRootPaths)
+```
+
+
+### Add Cy Removal
+```{r add Cy removal gate}
+# alice asked that we add a Cd Removal gate to all paths
+rootPaths$pathOriginal = rootPaths$path
+# rootPaths$path = rootPaths$pathOriginal
+rootPaths$path = paste0("Cd Removal/", rootPaths$path)
+```
+
+## Gating functions
+
+```{r some helpful functions}
+# load various functions that we are going to use for gating
+source("/Users/rgomez/Khor_covidvax_response_IMPACD/R/cytof_gating_RG_2025_10.R")
+# after: source("R/cytof_gating.R")
+if (!exists("level2GatingStephan") && exists("level2Gating")) {
+  level2GatingStephan <- level2Gating
+}
+```
+
+## Test before gating
+
+```{r test my root pathing}
+getRootPathTcells(rootPaths$path[1], gateListAll, gatesAll)
+getRootPathTcells(rootPaths$path[2], gateListAll, gatesAll)
+getRootPathTcells(rootPaths$path[10], gateListAll, gatesAll)
+getRootPathTcells(rootPaths$path[61], gateListAll, gatesAll)
+getRootPathTcells(rootPaths$path[70], gateListAll, gatesAll)
+getRootPathTcells(rootPaths$path[58], gateListAll, gatesAll)
+pathToGate = rootPaths$path[58]
+
+```
+
+```{r test on a gating set}
+gs = getGatingSet(design)
+
+batch_ = 1
+path_ = 1
+test = getRootPathTcells(rootPaths$path[path_], gateListAll, gatesAll[[batch_]], gs[[batch_]])
+recompute(gs[[batch_]])
+x = gs_pop_get_count_fast(gs[[batch_]], format = "long")
+
+batch_ = 2
+path_ = 2
+test = getRootPathTcells(rootPaths$path[path_], gateListAll, gatesAll[[batch_]], gs[[batch_]])
+recompute(gs[[batch_]])
+x = gs_pop_get_count_fast(gs[[batch_]], format = "long")
+
+batch_ = 3
+path_ = 10
+test = getRootPathTcells(rootPaths$path[path_], gateListAll, gatesAll[[batch_]], gs[[batch_]])
+recompute(gs[[batch_]])
+x = gs_pop_get_count_fast(gs[[batch_]], format = "long")
+
+batch_ = 4
+path_ = 61
+test = getRootPathTcells(rootPaths$path[path_], gateListAll, gatesAll[[batch_]], gs[[batch_]])
+recompute(gs[[batch_]])
+x = gs_pop_get_count_fast(gs[[batch_]], format = "long")
+
+batch_ = 5
+path_ = 70
+test = getRootPathTcells(rootPaths$path[path_], gateListAll, gatesAll[[batch_]], gs[[batch_]])
+recompute(gs[[batch_]])
+x = gs_pop_get_count_fast(gs[[batch_]], format = "long")
+
+batch_ = 6
+path_ = 58
+test = getRootPathTcells(rootPaths$path[path_], gateListAll, gatesAll[[batch_]], gs[[batch_]])
+recompute(gs[[batch_]])
+x = gs_pop_get_count_fast(gs[[batch_]], format = "long")
+```
+
+
+```{r one more test}
+# This should all run without crashes
+for (rootPath_ in rootPaths$path) {
+  getRootPathTcells(rootPath_, gateListAll, gatesAll[[1]])
+}
+
+```
+
+### IMPACD gating test
+
+
+```{r a few more things that need to be added}
+
+#one last test
+getRootPathTcells(rootPaths$path[58], gateListAll, gatesAll)
+
+batch_ = 7
+path_ = 58
+test = getRootPathTcells(rootPaths$path[path_], gateListAll, gatesAll[[batch_]], gs[[batch_]])
+recompute(gs[[batch_]])
+x = gs_pop_get_count_fast(gs[[batch_]], format = "long")
+
+```
+
+
+```{r run on a single batch and rootpath for now}
+
+batch_ = 8
+path_ = 58
+test = getRootPathTcells(rootPaths$path[path_], gateListAll, gatesAll[[batch_]], gs[[batch_]])
+recompute(gs[[batch_]])
+x = gs_pop_get_count_fast(gs[[batch_]], format = "long")
+
+
+
+rootPath = str_split(rootPaths$path[path_], "/")[[1]]
+modifierNodes = dplyr::filter(gateListAll, type == "modifier")
+modifierNodes = dplyr::filter(modifierNodes, !(node %in% rootPath))
+if (str_detect(rootPaths$path[path_], "CD27")) {
+  modifierNodes = dplyr::filter(modifierNodes, node != "CD27+")
+}
+
+# make a list modifierGates, which uses the entries in gatesAll[[batch_]][idx] where idx is the index of the modifierNodes
+modifierGates = gatesAll[[batch_]][modifierNodes$idx]
+names(modifierGates) = modifierNodes$node
+
+
+gatemetadata = data.frame(name = modifierNodes$node,
+                          gate_type = "2D",
+                          marker1 = NA,
+                          marker2 = NA,
+                          original_gate_position = NA,
+                          logical_gate = FALSE,
+                          transformed_gate_position = NA)
+
+
+# --- NEW: prune modifiers that are missing/invalid in this batch ---
+ok <- vapply(modifierGates, function(g) !is.null(g) && inherits(g, "filter"), logical(1))
+
+if (any(!ok)) {
+  dropped <- modifierNodes$name[!ok]
+  message("Dropping ", sum(!ok), " invalid modifier gate(s) in batch ", batch_, ": ",
+          paste(dropped, collapse = ", "))
+  modifierNodes <- modifierNodes[ok, , drop = FALSE]
+  modifierGates <- modifierGates[ok]
+  gatemetadata  <- gatemetadata[ok, , drop = FALSE]
+}
+
+# If nothing left, skip level-2 gating for this batch to avoid crash
+if (length(modifierGates) == 0L) {
+  message("No valid modifier gates for batch ", batch_, " — skipping level2Gating for this batch.")
+} else {
+  level2_paths = level2Gating(
+    gs[[batch_]],
+    modifierNodes$node, gatemetadata, modifierGates,
+    paste0("/", rootPaths$path[path_]),
+    max_depth = 3,
+    level1_nodes = modifierNodes$node,
+    cellcountCutoff = 0
+  )
+}
+
+
+# level2_paths = level2Gating(gs[[batch_]] ,
+#                             modifierNodes$node, gatemetadata, modifierGates,
+#                             paste0("/", rootPaths$path[path_]),
+#                             max_depth = 3,
+#                             level1_nodes = modifierNodes$node,
+#                             cellcountCutoff = 0)
+
+
+
+counts = getRawCounts(gs, design)
+
+# write counts to an Rdata file
+fname <- str_replace_all(rootPaths$name[path_], "/", "_")
+dataFileName <- paste0(fname, ".Rdata")
+save(counts, file = file.path(rawCountsDir, dataFileName))
+
+```
+
+
+```{r process paths}
+
+# combine with design
+counts = merge(counts, design, by.x = "name", by.y = "fcsName")
+# rename column name to fcsName
+colnames(counts)[colnames(counts) == "name"] = "fcsName"
+counts = dplyr::filter(counts, control == FALSE)
+
+# extract the populations
+nodes = data.frame(path = unique(counts$Population))
+
+nodes = processGatingPaths(nodes, max_depth = 3)
+
+nodes = assignRoot(nodes, rootPaths$path[path_])
+nodes$pathInCompartment = str_remove(nodes$pathInCompartment, "^/")
+
+nodes$subset = paste(rootPaths$name[path_], nodes$pathInCompartment, sep = "/")
+# remove trailing / from subset
+nodes$subset = str_remove(nodes$subset, "/$")
+
+nodes$subset[is.na(nodes$rootPath)] = NA
+
+
+counts = merge(counts, nodes, by.x = "Population", by.y = "path")
+# this is also going to remove all of the AIM+ nodes that we didn't use
+
+```
+
+
+```{r turn into matrices}
+
+matrices = convertToMatrix(dplyr::filter(counts, !is.na(subset)), depths = c(0, 1, 2, 3))
+
+# matrices = convertToMatrix(counts, depths = c(0, 1, 2, 3))
+
+matrices[["nodes"]] = nodes
+matrices[["design"]] = design
+
+# save matrices (processed)
+save(matrices, file = file.path(processedCountsDir, dataFileName))
+
+
+```
+
+## IMPACD gating
+
+
+```{r run the gating}
+# only use this if you want to run all the gating
+# for a more targeted (some of the subsets might already exist) approach, see the next cell
+# for (path_ in c(1:nrow(rootPaths))) {
+#   gateAndSave(path_)
+# }
+
+```
+
+```{r check that all files are present}
+# since I ran across multiple machines, I need to make sure all the data is here
+
+# get all the files that end in .Rdata in "data/counts"
+presentCountFiles = list.files(processedCountsDir, pattern = ".Rdata", full.names = TRUE)
+# remove the path and the .Rdata
+presentCountFiles = str_remove_all(presentCountFiles, ".Rdata")
+presentCountFiles = basename(presentCountFiles)
+presentCountFiles = str_replace_all(presentCountFiles, "_", "/")
+presentCountFiles = str_replace_all(presentCountFiles, "Th1/17", "Th1_17")
+
+# add a column present to rootPaths if the file is present
+rootPaths$present = rootPaths$name %in% presentCountFiles
+
+dplyr::filter(rootPaths, !present)
+
+# all roots accounted for, great!
+
+# run the missing ones
+for (missing in dplyr::filter(rootPaths, !present)$name) {
+  
+  path_ = which(rootPaths$name == missing)
+  # print(path_)
+  gateAndSave(path_)
+}
+
+
+
+```
+
+
+```{r open and resave R data files}
+### commented out becaue this is a hacky way to compress files and its throwing an error now that i've modified the code. RG 13 Oct 2025
+
+
+# I generated most of the counts files on the rstudio server instance. I noticed that those files were about 40 MB.
+# The same data files generated on my local machine would be only 4 MB. I suspect that the server instance is using a different compression, but
+# both files can be opened with any R version.
+# Hence, after running all the gating on the server, I am going to open and resave the files on my local machine, to take advantage of the better compression.
+# And then add the smaller files to the git repository.
+# files = list.files("data/counts", pattern = ".Rdata", full.names = T) 
+# for (iFile in 1:length(files) ) {
+#   file = files[iFile]
+#   # extract the name of the file, without the path and extension
+#   
+#   load(file)
+#   
+#   save(matrices, file = file)
+#   
+# }
+
+```
+
+                         ## Export gates
+
+```{r export gates}
+# We might need the gates that were used to generate the counts files in the post analysis (e.g. supervised signatures).
+
+save(gateListAll, gatesAll, trans, rootPaths, file = "/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/CyTOF/CyTOF_gates.Rdata")
+
+
+```
+
+
+```{r run only the 24 corrected roots}
+# 1) Your 24 target roots as underscore names (do not edit spelling)
+targets_underscore <- c(
+  # "CD4Teff_CentralMemory",
+  # "CD4Teff_CentralMemory_Th1_17",
+  # "CD4Teff_CentralMemory_Th1",
+  # "CD4Teff_CentralMemory_Th17",
+  #"CD4Teff_CentralMemory_Th2",
+  #"CD4Teff_TEMRA",
+  #"CD4Teff_TEMRA_Th1_17",
+  #"CD4Teff_TEMRA_Th1",
+  #"CD4Teff_TEMRA_Th17",
+  #"CD4Teff_TEMRA_Th2",
+  # "CD4TFH_CentralMemory",
+  # "CD4TFH_CentralMemory_Th1_17",
+  # "CD4TFH_CentralMemory_Th1",
+  # "CD4TFH_CentralMemory_Th17",
+  # "CD4TFH_CentralMemory_Th2",
+  #"CD4TFH_TEMRA_Th1_17",
+  #"CD4TFH_TEMRA_Th1",
+  #"CD4TFH_TEMRA_Th17",
+  #"CD4TFH_TEMRA_Th2",
+  #"CD4TFH_TEMRA",
+ # "CD4Treg_CentralMemory",
+  "CD4Treg_TEMRA",
+  #"CD8Teff_CentralMemory",
+  "CD8Teff_TEMRA"
+)
+
+# 2) Map underscore names to rootPaths$name (which use "/")
+#    We'll normalize rootPaths$name by replacing "/" -> "_" and match.
+rp_norm <- setNames(gsub("/", "_", rootPaths$name, fixed = TRUE), rootPaths$name)
+
+# Which of the requested targets are present?
+present_mask <- targets_underscore %in% rp_norm
+if (any(!present_mask)) {
+  warning("These requested roots were not found in rootPaths$name (after normalization): ",
+          paste(targets_underscore[!present_mask], collapse = ", "))
+}
+
+# 3) Get the corresponding indices in rootPaths for the ones that exist
+wanted_slash_names <- names(rp_norm)[match(targets_underscore[present_mask], rp_norm)]
+idx <- match(wanted_slash_names, rootPaths$name)
+idx <- unique(idx[!is.na(idx)])
+
+message("Will gate and save ", length(idx), " root(s).")
+
+# 4) Run gateAndSave() for each target root
+for (path_ in idx) {
+  print(paste0(">>> Running: ", rootPaths$name[path_]))
+  gateAndSave(path_)
+}                                                             
+
+message("Done. The                       24 corrected artifacts should be in:\n",         
+        "  raw counts:    "          , rawCountsDir, "\n",
+        "  processed Rdata:", processedCountsDir)
+
+```                               

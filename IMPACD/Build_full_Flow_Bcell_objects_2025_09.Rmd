@@ -1,0 +1,1499 @@
+---
+title: "Build flow Bcell Rdata objects"
+output: html_document
+date: "2025-09-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Build the 5-matrix PBplus data object after running PBplus_gating_flow_B_cells_RG_2025 thru to line 771, or the end of the ```{r summarize counts for new root path, save} chunk
+
+```{r build full PB plus object with all 5 matrices}
+suppressPackageStartupMessages({library(dplyr); library(tidyr); library(stringr)})
+
+####check object names
+
+# nm <- load("/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/counts_NEW_PBplus.Rdata")
+# print(nm)   # <- the actual object names that were loaded
+# ls()        # sanity check
+
+# ---- Inputs ----
+file <- "/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/counts_NEW_PBplus.Rdata"
+nm <- load(file)  # returns vector of object names created
+
+# If the expected symbol isn't there, pick the right one and alias it
+if (!exists("counts_NEW_PBplus", inherits = TRUE)) {
+  # heuristic: look for a data.frame/tibble with Population & name columns
+  pick <- NULL
+  for (n in nm) {
+    obj <- get(n, inherits = TRUE)
+    if (is.data.frame(obj) && all(c("Population","name") %in% names(obj))) { pick <- n; break }
+  }
+  if (is.null(pick) && length(nm) == 1) pick <- nm[1]
+  stopifnot(!is.null(pick))
+  counts_NEW_PBplus <- get(pick, inherits = TRUE)
+}
+# double-check expected structure
+stopifnot(is.data.frame(counts_NEW_PBplus))
+
+#load("/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/counts_NEW_PBplus.Rdata") # -> counts_NEW_PBplus (long)
+stopifnot(exists("design"))
+
+
+# ROOTS
+root_all <- "/Live_Stringent/LYM/Barcode/CD19+ dump-/B cells/PB+"
+root_ag  <- "/Live_Stringent/LYM/Barcode/CD19+ dump-/B cells/RBD+/PB+"
+
+strip_prefix <- function(x, prefix){
+  out <- x
+  i1 <- startsWith(x, paste0(prefix, "/")); out[i1] <- substring(x[i1], nchar(prefix) + 2L)
+  i2 <- startsWith(x, prefix) & !i1;        out[i2] <- substring(x[i2], nchar(prefix) + 1L)
+  out
+}
+
+# ---- Long table with ALId + compartment + relative subset ----
+# Map each FCS to ALId and metadata (robust to column name variations)
+design_map <- design %>%
+  mutate(
+    sample_file = dplyr::coalesce(
+      get0("sampleNameOriginal", ifnotfound = NULL),
+      get0("sampleName",         ifnotfound = NULL),
+      basename(get0("fcsFiles",  ifnotfound = ""))  # fallback
+    ),
+    sample_key  = sub("\\.fcs$","", basename(sample_file))
+  ) %>%
+  select(
+    ALId, sample_key,
+    patientType = any_of("patientType"),
+    khorLabId   = any_of("khorLabId"),
+    ageAtDraw   = any_of("ageAtDraw"),
+    sex         = any_of("sex"),
+    group       = any_of("group"),
+    batch       = any_of("batch"),
+    fcs_file        = any_of("fcsFiles"),
+    transformed_fcs = any_of("transformedFcs"),
+    drawDate        = any_of("drawDate"),
+    race            = any_of("race"),
+    hispanic        = any_of("hispanic")
+  ) %>%
+  distinct()
+
+# Attach ALId/metadata to counts_NEW_PBplus
+df <- counts_NEW_PBplus %>%
+  mutate(
+    sample_key  = sub("\\.fcs$","", basename(as.character(name))),
+    compartment = if_else(grepl("/RBD\\+/", Population), "antigen_specific", "global")
+  ) %>%
+  left_join(design_map, by = "sample_key") %>%
+  dplyr::filter(!grepl("IC", sample_key, fixed = TRUE))
+
+# Sanity: drop rows missing ALId (cannot pivot by AL)
+missing_al <- df %>% dplyr::filter(is.na(ALId)) %>% distinct(sample_key)
+if (nrow(missing_al)) message("Warning: dropping ", nrow(missing_al), " rows with missing ALId.")
+
+df <- df %>% dplyr::filter(!is.na(ALId))
+
+# Relative subset under the two SM roots
+rel <- character(nrow(df))
+i_all <- startsWith(df$Population, root_all)
+i_ag  <- startsWith(df$Population, root_ag)
+rel[i_all] <- strip_prefix(df$Population[i_all], root_all)
+rel[i_ag ] <- strip_prefix(df$Population[i_ag ], root_ag )
+df$rel_subset <- rel
+
+# Final subset label: compartment + "/" + relative (root becomes just "global"/"antigen_specific")
+df$subset_label <- if_else(df$rel_subset == "" | is.na(df$rel_subset),
+                           df$compartment,
+                           paste0(df$compartment, "/", df$rel_subset))
+
+# ---- Matrices: rows=subset_label, cols=ALId ----
+collapse_wide <- function(dat, value_col){
+  dat %>%
+    group_by(subset_label, ALId) %>%
+    summarize(val = dplyr::first(.data[[value_col]]), .groups = "drop") %>%
+    mutate(ALId = as.character(ALId)) %>%
+    pivot_wider(names_from = ALId, values_from = val) %>%
+    arrange(subset_label)
+}
+
+pctParent    <- collapse_wide(df, "PercentParent")
+parentCounts <- collapse_wide(df, "ParentCount")
+popCounts    <- collapse_wide(df, "Count")
+
+## ---- Nodes: terminal_node + clean modifiers + root columns ----
+# pick the subset column you actually have
+subset_vec <- if ("subset_label" %in% names(pctParent)) pctParent$subset_label else pctParent$subset
+
+make_nodes <- function(subset_vec, root_all, root_ag) {
+  comp <- ifelse(grepl("^antigen_specific($|/)", subset_vec), "antigen_specific", "global")
+  rel  <- ifelse(comp == "global",
+                 sub("^global/?", "", subset_vec),
+                 sub("^antigen_specific/?", "", subset_vec))
+  
+  parts <- strsplit(rel, "/", fixed = TRUE)
+  ncomp <- vapply(parts, length, integer(1))
+  
+  terminal_node <- vapply(seq_along(parts), function(i) {
+    if (ncomp[i] == 0) comp[i] else tail(parts[[i]], 1)
+  }, character(1))
+  
+  modifier_1 <- vapply(seq_along(parts), function(i) {
+    if (ncomp[i] >= 2) parts[[i]][1] else NA_character_
+  }, character(1))
+  
+  modifier_2 <- vapply(seq_along(parts), function(i) {
+    if (ncomp[i] >= 3) parts[[i]][2] else NA_character_
+  }, character(1))
+  
+  depth <- ncomp  # root (no tokens) = 0; single token = 1; etc.
+  
+  rootPath <- ifelse(comp == "global", root_all, root_ag)
+  pathInCompartment <- ifelse(ncomp == 0, NA_character_, rel)
+  path <- ifelse(ncomp == 0, rootPath, paste(rootPath, rel, sep = "/"))
+  
+   # compute root as "global/<relative_root>" or "antigen_specific/<relative_root>"
+  base_prefix <- "/Live_Stringent/LYM/Barcode/CD19+ dump-/B cells"
+  root <- ifelse(
+    comp == "global",
+    paste0("global/", strip_prefix(root_all, base_prefix)),            # -> "global/PB+"
+    paste0("antigen_specific/", strip_prefix(root_ag,  base_prefix))   # -> "antigen_specific/RBD+/PB+"
+  )
+
+  data.frame(
+    subset            = subset_vec,
+    depth             = depth,
+    terminal_node     = terminal_node,
+    modifier_1        = modifier_1,
+    modifier_2        = modifier_2,
+    pathInCompartment = pathInCompartment,
+    rootPath          = rootPath,
+    root              = root,
+    path              = path,
+    stringsAsFactors  = FALSE
+  )
+
+}
+
+nodes <- make_nodes(subset_vec, root_all, root_ag)
+
+
+# helper: pick first non-NA / non-blank
+first_non_na <- function(x) {
+  y <- x[!is.na(x) & x != ""]
+  if (length(y)) y[1] else NA
+}
+
+## ---- Design: one row per ALId, with paired sample names/paths ----
+# collapse to a single record per (ALId, compartment)
+pair_map <- df %>%
+  mutate(ALId = as.character(ALId)) %>%
+  group_by(ALId, compartment) %>%
+  summarize(
+    sample_key      = first_non_na(sample_key),
+    fcs_file        = first_non_na(fcs_file),
+    transformed_fcs = first_non_na(transformed_fcs),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(
+    id_cols    = ALId,
+    names_from = compartment,
+    values_from = c(sample_key, fcs_file, transformed_fcs),
+    names_sep  = "_"
+  ) %>%
+  dplyr::rename(
+    sample_global            = sample_key_global,
+    sample_ag                = sample_key_antigen_specific,
+    fcs_file_global          = fcs_file_global,
+    fcs_file_ag              = fcs_file_antigen_specific,
+    transformed_fcs_global   = transformed_fcs_global,
+    transformed_fcs_ag       = transformed_fcs_antigen_specific
+  )
+
+## ---- Metadata per ALId (only over columns that exist) ----
+meta_cols <- intersect(
+  c("patientType","khorLabId","ageAtDraw","sex","group","batch","drawDate","race","hispanic"),
+  names(df)
+)
+
+meta_by_AL <- df %>%
+  mutate(ALId = as.character(ALId)) %>%
+  group_by(ALId) %>%
+  summarize(
+    across(all_of(meta_cols), first_non_na, .names = "{.col}"),
+    .groups = "drop"
+  )
+
+design_out <- meta_by_AL %>%
+  full_join(pair_map, by = "ALId") %>%
+  arrange(ALId)
+
+
+# Reorder matrices’ columns to ALId order in design_out
+al_order <- design_out$ALId
+have     <- intersect(colnames(pctParent), al_order)
+pctParent    <- pctParent    %>% select(subset_label, all_of(have)) %>% rename(subset = subset_label)
+parentCounts <- parentCounts %>% select(subset_label, all_of(have)) %>% rename(subset = subset_label)
+popCounts    <- popCounts    %>% select(subset_label, all_of(have)) %>% rename(subset = subset_label)
+
+# ---- Package & save ----
+New_matrices_PBplus <- list(
+  parentCounts = parentCounts,
+  popCounts    = popCounts,
+  pctParent    = pctParent,
+  design       = design_out,   # must contain ALId
+  nodes        = nodes
+)
+
+library(dplyr)
+
+# Normalize ALId type on both tables
+New_matrices_PBplus$design <- New_matrices_PBplus$design %>% mutate(ALId = as.character(ALId))
+design_fix <- design %>% mutate(ALId = as.character(ALId))
+
+# Pick up the two fields from your original 'design' if they exist
+want <- intersect(c("testId", "longitudinalDrawDescription"), names(design_fix))
+
+if (length(want)) {
+  extra_by_AL <- design_fix %>%
+    group_by(ALId) %>%
+    summarize(across(all_of(want), ~ dplyr::first(na.omit(.x))), .groups = "drop")
+  
+  # Attach without dropping anything already present
+  New_matrices_PBplus$design <- New_matrices_PBplus$design %>%
+    left_join(extra_by_AL, by = "ALId")
+}
+
+# Save
+dir.create("/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/roots",
+           showWarnings = FALSE, recursive = TRUE)
+
+save(New_matrices_PBplus,
+     file = "/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/roots/Full_object_PBplus.Rdata")
+```
+
+## build full non-PB Bcells object with all 5 matrices
+
+```{r build full non-PB Bcells object with all 5 matrices}
+
+
+## Build reference-style full object for non-PB Bcells: columns = ALId, subsets prefixed by compartment
+suppressPackageStartupMessages({library(dplyr); library(tidyr); library(stringr)})
+
+# ---- Inputs (minimal) ----
+file <- "/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/counts_Bcells.Rdata"
+nm <- load(file)  # returns object names in the file
+
+# The file currently contains 'counts' (not 'counts_Bcells')
+if (exists("counts_Bcells")) {
+  # use it as-is
+} else if (exists("counts")) {
+  counts_Bcells <- counts
+} else {
+  stop("Neither 'counts_Bcells' nor 'counts' found in the loaded file: ", paste(nm, collapse=", "))
+}
+
+stopifnot(is.data.frame(counts_Bcells))
+
+
+#load("/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/counts_NEW_PBplus.Rdata") # -> counts_NEW_PBplus (long)
+stopifnot(exists("design"))
+
+
+suppressPackageStartupMessages({library(dplyr); library(tidyr); library(stringr)})
+
+# --- Roots (your current layout) ---
+root_all <- "/Live_Stringent/LYM/Barcode/CD19+ dump-/B cells/PB"
+root_ag  <- "/Live_Stringent/LYM/Barcode/CD19+ dump-/B cells/RBD+/PB"
+
+strip_prefix <- function(x, prefix){
+  out <- x
+  i1 <- startsWith(x, paste0(prefix, "/")); out[i1] <- substring(x[i1], nchar(prefix) + 2L)
+  i2 <- startsWith(x, prefix) & !i1;        out[i2] <- substring(x[i2], nchar(prefix) + 1L)
+  out
+}
+
+# --- Pick the wide matrices you actually have ---
+W_counts       <- if (exists("counts")) counts else if (exists("pop_counts")) pop_counts else stop("No counts/pop_counts matrix found")
+W_parentCounts <- parentCounts
+W_pctParent    <- pctParent
+
+stopifnot(is.data.frame(W_counts),  "subset" %in% names(W_counts))
+stopifnot(is.data.frame(W_parentCounts), "subset" %in% names(W_parentCounts))
+stopifnot(is.data.frame(W_pctParent),    "subset" %in% names(W_pctParent))
+
+# --- Helper: build a compartment-specific ALId-wide matrix from a wide table ---
+make_comp_mat <- function(W, design, comp_label, root_prefix) {
+  # columns to keep (this enforces global=PRE and antigen=ENRICHED because design is filtered)
+  keep_samples <- design %>% dplyr::filter(compartment == comp_label) %>% pull(sampleName)
+  have <- intersect(keep_samples, names(W))
+  if (length(have) == 0) stop("No columns in wide matrix match design sampleName for compartment: ", comp_label)
+  
+  M <- W %>% select(subset, all_of(have))
+  
+  # rename columns to ALId
+  map <- design %>% dplyr::filter(compartment == comp_label) %>% select(sampleName, ALId)
+  new_names <- map$ALId[match(have, map$sampleName)]
+  colnames(M)[match(have, names(M))] <- new_names
+  
+  # subset label: prefix with compartment; strip root to relative
+  rel <- strip_prefix(M$subset, root_prefix)
+  subset_label <- ifelse(rel == "" | is.na(rel), comp_label, paste0(comp_label, "/", rel))
+  
+  # long -> collapse unique (subset, ALId) -> back to wide with ALId columns
+  M_long <- M %>%
+    mutate(subset_label = subset_label) %>%
+    select(-subset) %>%
+    pivot_longer(-subset_label, names_to = "ALId", values_to = "val")
+  
+  M_wide <- M_long %>%
+    group_by(subset_label, ALId) %>%
+    summarize(val = dplyr::first(val), .groups = "drop") %>%
+    pivot_wider(names_from = ALId, values_from = val) %>%
+    arrange(subset_label)
+  
+  # uniform 'subset' column name downstream
+  M_wide <- M_wide %>% rename(subset = subset_label)
+  M_wide
+}
+
+# --- Build the three matrices, compartment by compartment, then bind rows ---
+C_global   <- make_comp_mat(W_counts,       design, "all_Bcells",       root_all)   %>%
+  mutate(subset = sub("^all_Bcells", "global", subset))
+C_antigen  <- make_comp_mat(W_counts,       design, "antigen_specific", root_ag)
+
+PC_global  <- make_comp_mat(W_parentCounts, design, "all_Bcells",       root_all)   %>%
+  mutate(subset = sub("^all_Bcells", "global", subset))
+PC_antigen <- make_comp_mat(W_parentCounts, design, "antigen_specific", root_ag)
+
+PP_global  <- make_comp_mat(W_pctParent,    design, "all_Bcells",       root_all)   %>%
+  mutate(subset = sub("^all_Bcells", "global", subset))
+PP_antigen <- make_comp_mat(W_pctParent,    design, "antigen_specific", root_ag)
+
+popCounts    <- bind_rows(C_global,  C_antigen)
+parentCounts <- bind_rows(PC_global, PC_antigen)
+pctParent    <- bind_rows(PP_global, PP_antigen)
+
+# --- Nodes table (from the bound subset labels) ---
+subset_vec <- popCounts$subset
+make_nodes <- function(subset_vec, root_all, root_ag) {
+  comp <- ifelse(grepl("^antigen_specific($|/)", subset_vec), "antigen_specific", "global")
+  rel  <- ifelse(comp == "global",
+                 sub("^global/?", "", subset_vec),
+                 sub("^antigen_specific/?", "", subset_vec))
+  parts <- strsplit(rel, "/", fixed = TRUE)
+  ncomp <- vapply(parts, length, integer(1))
+  terminal_node <- vapply(seq_along(parts), function(i) if (ncomp[i]==0) comp[i] else tail(parts[[i]],1), character(1))
+  modifier_1    <- vapply(seq_along(parts), function(i) if (ncomp[i]>=2) parts[[i]][1] else NA_character_, character(1))
+  modifier_2    <- vapply(seq_along(parts), function(i) if (ncomp[i]>=3) parts[[i]][2] else NA_character_, character(1))
+  depth         <- ncomp
+  rootPath      <- ifelse(comp == "global", root_all, root_ag)
+  pathInComp    <- ifelse(ncomp==0, NA_character_, rel)
+  path          <- ifelse(ncomp==0, rootPath, paste(rootPath, rel, sep="/"))
+  data.frame(subset=subset_vec, depth, terminal_node, modifier_1, modifier_2,
+             pathInCompartment=pathInComp, rootPath=rootPath, root=comp, path=path,
+             stringsAsFactors = FALSE)
+}
+nodes <- make_nodes(subset_vec, root_all, root_ag)
+
+# --- Design_out: one row per ALId with metadata (from your filtered 'design') ---
+first_non_na <- function(x){ y <- x[!is.na(x) & x!=""]; if (length(y)) y[1] else NA }
+
+meta_cols <- intersect(
+  c("patientType","khorLabId","ageAtDraw","sex","group","batch",
+    "drawDate","race","hispanic","timePoint","control"),
+  names(design)
+)
+
+design_out <- design %>%
+  mutate(ALId = as.character(ALId)) %>%
+  group_by(ALId) %>%
+  summarize(across(all_of(meta_cols), first_non_na, .names = "{.col}"),
+            .groups = "drop") %>%
+  arrange(ALId)
+
+# If you want to add testId & longitudinalDrawDescription from 'design'
+want <- intersect(c("testId", "longitudinalDrawDescription"), names(design))
+if (length(want)) {
+  extra_by_AL <- design %>% group_by(ALId) %>%
+    summarize(across(all_of(want), ~ first_non_na(.x)), .groups="drop")
+  design_out <- design_out %>% left_join(extra_by_AL, by="ALId")
+}
+
+# --- Reorder matrix columns to ALId order ---
+al_order <- design_out$ALId
+keepc <- function(M){
+  have <- intersect(colnames(M), c("subset", al_order))
+  M %>% select(all_of(have)) %>% relocate(subset)
+}
+popCounts    <- keepc(popCounts)
+parentCounts <- keepc(parentCounts)
+pctParent    <- keepc(pctParent)
+
+# --- Drop the PB+ artifact rows if present ---
+drop_rows <- c("global/+", "antigen_specific/+")
+popCounts    <- popCounts   [!popCounts$subset    %in% drop_rows, , drop = FALSE]
+parentCounts <- parentCounts[!parentCounts$subset %in% drop_rows, , drop = FALSE]
+pctParent    <- pctParent   [!pctParent$subset    %in% drop_rows, , drop = FALSE]
+
+# --- Package & save ---
+New_matrices_Bcells <- list(
+  parentCounts = parentCounts,
+  popCounts    = popCounts,
+  pctParent    = pctParent,
+  design       = design_out,
+  nodes        = nodes
+)
+
+dir.create("/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/roots",
+           showWarnings = FALSE, recursive = TRUE)
+
+save(New_matrices_Bcells,
+     file = "/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/roots/Full_object_Bcells.Rdata")
+
+suppressPackageStartupMessages({library(dplyr); library(tidyr)})
+
+# Build pre/enriched file columns from your filtered design
+fcs_pairs <- design %>%
+  select(ALId, compartment, sampleName, sampleNameOriginal, fcsFiles, transformedFcs) %>%
+  mutate(compartment = recode(compartment,
+                              "all_Bcells"       = "pre",
+                              "antigen_specific" = "enriched")) %>%
+  pivot_wider(
+    id_cols    = ALId,
+    names_from = compartment,
+    values_from = c(sampleName, sampleNameOriginal, fcsFiles, transformedFcs),
+    names_sep  = "_"
+  ) %>%
+  rename(
+    sample_pre                 = sampleName_pre,
+    sample_enriched            = sampleName_enriched,
+    sample_raw_pre             = sampleNameOriginal_pre,
+    sample_raw_enriched        = sampleNameOriginal_enriched,
+    fcs_file_pre               = fcsFiles_pre,
+    fcs_file_enriched          = fcsFiles_enriched,
+    transformed_fcs_pre        = transformedFcs_pre,
+    transformed_fcs_enriched   = transformedFcs_enriched
+  )
+
+# Attach and save
+New_matrices_Bcells$design <- New_matrices_Bcells$design %>%
+  left_join(fcs_pairs, by = "ALId")
+
+save(New_matrices_Bcells,
+     file = "/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/roots/Full_object_Bcells.Rdata")
+```
+
+## build full Q1: switched memory object with all 5 matrices
+```{r build full Q1: switched memory object with all 5 matrices}
+
+## Build reference-style full object for SM (Q1): columns = ALId, subsets prefixed by compartment
+suppressPackageStartupMessages({library(dplyr); library(tidyr); library(stringr)})
+
+# ---- Inputs ----
+load("/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/counts_NEW_SM.Rdata") # -> counts_SM (long)
+stopifnot(exists("design"))
+
+# Exact SM roots (auto paths)
+root_all <- "/Live_Stringent/LYM/Barcode/CD19+ dump-/B cells/PB/Q1: IgD_BUV615- , CD27_APCR700+"
+root_ag  <- "/Live_Stringent/LYM/Barcode/CD19+ dump-/B cells/RBD+/PB/Q1: IgD_BUV615- , CD27_APCR700+"
+
+strip_prefix <- function(x, prefix){
+  out <- x
+  i1 <- startsWith(x, paste0(prefix, "/")); out[i1] <- substring(x[i1], nchar(prefix) + 2L)
+  i2 <- startsWith(x, prefix) & !i1;        out[i2] <- substring(x[i2], nchar(prefix) + 1L)
+  out
+}
+
+# ---- Long table with ALId + compartment + relative subset ----
+# Map each FCS to ALId and metadata (robust to column name variations)
+design_map <- design %>%
+  mutate(
+    sample_file = dplyr::coalesce(
+      get0("sampleNameOriginal", ifnotfound = NULL),
+      get0("sampleName",         ifnotfound = NULL),
+      basename(get0("fcsFiles",  ifnotfound = ""))  # fallback
+    ),
+    sample_key  = sub("\\.fcs$","", basename(sample_file))
+  ) %>%
+  select(
+    ALId, sample_key,
+    patientType = any_of("patientType"),
+    khorLabId   = any_of("khorLabId"),
+    ageAtDraw   = any_of("ageAtDraw"),
+    sex         = any_of("sex"),
+    group       = any_of("group"),
+    batch       = any_of("batch"),
+    fcs_file        = any_of("fcsFiles"),
+    transformed_fcs = any_of("transformedFcs"),
+    drawDate        = any_of("drawDate"),
+    race            = any_of("race"),
+    hispanic        = any_of("hispanic")
+  ) %>%
+  distinct()
+
+# Attach ALId/metadata to counts_SM
+df <- counts%>%
+  mutate(
+    sample_key  = sub("\\.fcs$","", basename(as.character(name))),
+    compartment = if_else(grepl("/RBD\\+/", Population), "antigen_specific", "global")
+  ) %>%
+  left_join(design_map, by = "sample_key") %>%
+  dplyr::filter(!grepl("IC", sample_key, fixed = TRUE))
+
+# Sanity: drop rows missing ALId (cannot pivot by AL)
+missing_al <- df %>% dplyr::filter(is.na(ALId)) %>% distinct(sample_key)
+if (nrow(missing_al)) message("Warning: dropping ", nrow(missing_al), " rows with missing ALId.")
+
+df <- df %>% dplyr::filter(!is.na(ALId))
+
+# Relative subset under the two SM roots
+rel <- character(nrow(df))
+i_all <- startsWith(df$Population, root_all)
+i_ag  <- startsWith(df$Population, root_ag)
+rel[i_all] <- strip_prefix(df$Population[i_all], root_all)
+rel[i_ag ] <- strip_prefix(df$Population[i_ag ], root_ag )
+df$rel_subset <- rel
+
+# Final subset label: compartment + "/" + relative (root becomes just "global"/"antigen_specific")
+df$subset_label <- if_else(df$rel_subset == "" | is.na(df$rel_subset),
+                           df$compartment,
+                           paste0(df$compartment, "/", df$rel_subset))
+
+# ---- Matrices: rows=subset_label, cols=ALId ----
+collapse_wide <- function(dat, value_col){
+  dat %>%
+    group_by(subset_label, ALId) %>%
+    summarize(val = dplyr::first(.data[[value_col]]), .groups = "drop") %>%
+    mutate(ALId = as.character(ALId)) %>%
+    pivot_wider(names_from = ALId, values_from = val) %>%
+    arrange(subset_label)
+}
+
+pctParent    <- collapse_wide(df, "PercentParent")
+parentCounts <- collapse_wide(df, "ParentCount")
+popCounts    <- collapse_wide(df, "Count")
+
+## ---- Nodes: terminal_node + clean modifiers + root columns ----
+# pick the subset column you actually have
+subset_vec <- if ("subset_label" %in% names(pctParent)) pctParent$subset_label else pctParent$subset
+
+make_nodes <- function(subset_vec, root_all, root_ag) {
+  comp <- ifelse(grepl("^antigen_specific($|/)", subset_vec), "antigen_specific", "global")
+  rel  <- ifelse(comp == "global",
+                 sub("^global/?", "", subset_vec),
+                 sub("^antigen_specific/?", "", subset_vec))
+  
+  parts <- strsplit(rel, "/", fixed = TRUE)
+  ncomp <- vapply(parts, length, integer(1))
+  
+  terminal_node <- vapply(seq_along(parts), function(i) {
+    if (ncomp[i] == 0) comp[i] else tail(parts[[i]], 1)
+  }, character(1))
+  
+  modifier_1 <- vapply(seq_along(parts), function(i) {
+    if (ncomp[i] >= 2) parts[[i]][1] else NA_character_
+  }, character(1))
+  
+  modifier_2 <- vapply(seq_along(parts), function(i) {
+    if (ncomp[i] >= 3) parts[[i]][2] else NA_character_
+  }, character(1))
+  
+  depth <- ncomp  # root (no tokens) = 0; single token = 1; etc.
+  
+  rootPath <- ifelse(comp == "global", root_all, root_ag)
+  pathInCompartment <- ifelse(ncomp == 0, NA_character_, rel)
+  path <- ifelse(ncomp == 0, rootPath, paste(rootPath, rel, sep = "/"))
+  
+  data.frame(
+    subset            = subset_vec,
+    depth             = depth,
+    terminal_node     = terminal_node,
+    modifier_1        = modifier_1,
+    modifier_2        = modifier_2,
+    pathInCompartment = pathInCompartment,
+    rootPath          = rootPath,
+    root = ifelse(
+  comp == "global",
+  paste0("global/", sub("^/Live_Stringent/LYM/Barcode/CD19\\+ dump-/B cells/?", "", root_all)),
+  paste0("antigen_specific/", sub("^/Live_Stringent/LYM/Barcode/CD19\\+ dump-/B cells/?", "", root_ag))
+)
+,
+    path              = path,
+    stringsAsFactors  = FALSE
+  )
+}
+
+nodes <- make_nodes(subset_vec, root_all, root_ag)
+
+
+# helper: pick first non-NA / non-blank
+first_non_na <- function(x) {
+  y <- x[!is.na(x) & x != ""]
+  if (length(y)) y[1] else NA
+}
+
+## ---- Design: one row per ALId, with paired sample names/paths ----
+# collapse to a single record per (ALId, compartment)
+pair_map <- df %>%
+  mutate(ALId = as.character(ALId)) %>%
+  group_by(ALId, compartment) %>%
+  summarize(
+    sample_key      = first_non_na(sample_key),
+    fcs_file        = first_non_na(fcs_file),
+    transformed_fcs = first_non_na(transformed_fcs),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(
+    id_cols    = ALId,
+    names_from = compartment,
+    values_from = c(sample_key, fcs_file, transformed_fcs),
+    names_sep  = "_"
+  ) %>%
+  dplyr::rename(
+    sample_global            = sample_key_global,
+    sample_ag                = sample_key_antigen_specific,
+    fcs_file_global          = fcs_file_global,
+    fcs_file_ag              = fcs_file_antigen_specific,
+    transformed_fcs_global   = transformed_fcs_global,
+    transformed_fcs_ag       = transformed_fcs_antigen_specific
+  )
+
+## ---- Metadata per ALId (only over columns that exist) ----
+meta_cols <- intersect(
+  c("patientType","khorLabId","ageAtDraw","sex","group","batch","drawDate","race","hispanic"),
+  names(df)
+)
+
+meta_by_AL <- df %>%
+  mutate(ALId = as.character(ALId)) %>%
+  group_by(ALId) %>%
+  summarize(
+    across(all_of(meta_cols), first_non_na, .names = "{.col}"),
+    .groups = "drop"
+  )
+
+design_out <- meta_by_AL %>%
+  full_join(pair_map, by = "ALId") %>%
+  arrange(ALId)
+
+
+# Reorder matrices’ columns to ALId order in design_out
+al_order <- design_out$ALId
+have     <- intersect(colnames(pctParent), al_order)
+pctParent    <- pctParent    %>% select(subset_label, all_of(have)) %>% rename(subset = subset_label)
+parentCounts <- parentCounts %>% select(subset_label, all_of(have)) %>% rename(subset = subset_label)
+popCounts    <- popCounts    %>% select(subset_label, all_of(have)) %>% rename(subset = subset_label)
+
+# ---- Package & save ----
+New_matrices_SM <- list(
+  parentCounts = parentCounts,
+  popCounts    = popCounts,
+  pctParent    = pctParent,
+  design       = design_out,   # must contain ALId
+  nodes        = nodes
+)
+
+library(dplyr)
+
+# Normalize ALId type on both tables
+New_matrices_SM$design <- New_matrices_SM$design %>% mutate(ALId = as.character(ALId))
+design_fix <- design %>% mutate(ALId = as.character(ALId))
+
+# Pick up the two fields from your original 'design' if they exist
+want <- intersect(c("testId", "longitudinalDrawDescription"), names(design_fix))
+
+if (length(want)) {
+  extra_by_AL <- design_fix %>%
+    group_by(ALId) %>%
+    summarize(across(all_of(want), ~ dplyr::first(na.omit(.x))), .groups = "drop")
+  
+  # Attach without dropping anything already present
+  New_matrices_SM$design <- New_matrices_SM$design %>%
+    left_join(extra_by_AL, by = "ALId")
+}
+
+# Save
+dir.create("/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/roots",
+           showWarnings = FALSE, recursive = TRUE)
+
+save(New_matrices_SM,
+     file = "/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/roots/Full_object_SM.Rdata")
+
+```
+## build full Q2: nonswitched memory object with all 5 matrices
+```{r build full Q2: nonswitched memory object with all 5 matrices}
+
+# --- Build full NSM object (Q2: NSM) with all 5 matrices ----------------------
+suppressPackageStartupMessages({library(dplyr); library(tidyr); library(stringr)})
+
+# ---- Inputs ----
+file <- "/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/counts_NEW_NSM.Rdata"
+nm <- load(file)  # returns object names; per your note, contains "counts"
+
+# Alias to a consistent name
+stopifnot(exists("counts", inherits = TRUE))
+counts_NEW_NSM <- get("counts", inherits = TRUE)
+stopifnot(is.data.frame(counts_NEW_NSM))
+
+# Require 'design' to be present in the environment (same as PBplus)
+stopifnot(exists("design"))
+
+# ROOTS (keep exactly as written)
+root_all <- "/Live_Stringent/LYM/Barcode/CD19+ dump-/B cells/PB/Q2: IgD_BUV615+ , CD27_APCR700+"
+root_ag  <- "/Live_Stringent/LYM/Barcode/CD19+ dump-/B cells/RBD+/PB/Q2: IgD_BUV615+ , CD27_APCR700+"
+
+strip_prefix <- function(x, prefix){
+  out <- x
+  i1 <- startsWith(x, paste0(prefix, "/")); out[i1] <- substring(x[i1], nchar(prefix) + 2L)
+  i2 <- startsWith(x, prefix) & !i1;        out[i2] <- substring(x[i2], nchar(prefix) + 1L)
+  out
+}
+
+# ---- Map FCS to ALId and metadata (robust to column variations) ----
+design_map <- design %>%
+  mutate(
+    sample_file = dplyr::coalesce(
+      get0("sampleNameOriginal", ifnotfound = NULL),
+      get0("sampleName",         ifnotfound = NULL),
+      basename(get0("fcsFiles",  ifnotfound = ""))  # fallback
+    ),
+    sample_key  = sub("\\.fcs$","", basename(sample_file))
+  ) %>%
+  select(
+    ALId, sample_key,
+    patientType = any_of("patientType"),
+    khorLabId   = any_of("khorLabId"),
+    ageAtDraw   = any_of("ageAtDraw"),
+    sex         = any_of("sex"),
+    group       = any_of("group"),
+    batch       = any_of("batch"),
+    fcs_file        = any_of("fcsFiles"),
+    transformed_fcs = any_of("transformedFcs"),
+    drawDate        = any_of("drawDate"),
+    race            = any_of("race"),
+    hispanic        = any_of("hispanic")
+  ) %>%
+  distinct()
+
+# ---- Attach ALId/metadata to counts_NEW_NSM ----
+# (Use Population-driven compartment call to avoid any latent mismatch)
+df <- counts_NEW_NSM %>%
+  mutate(
+    sample_key  = sub("\\.fcs$","", basename(as.character(name))),
+    compartment = if_else(grepl("/RBD\\+/", Population), "antigen_specific", "global")
+  ) %>%
+  left_join(design_map, by = "sample_key") %>%
+  dplyr::filter(!grepl("IC", sample_key, fixed = TRUE))
+
+# Drop rows lacking ALId (can’t pivot)
+missing_al <- df %>% dplyr::filter(is.na(ALId)) %>% distinct(sample_key)
+if (nrow(missing_al)) message("Warning: dropping ", nrow(missing_al), " rows with missing ALId.")
+df <- df %>% dplyr::filter(!is.na(ALId))
+
+# ---- Relative subset under the two NSM roots ----
+rel <- character(nrow(df))
+i_all <- startsWith(df$Population, root_all)
+i_ag  <- startsWith(df$Population, root_ag)
+rel[i_all] <- strip_prefix(df$Population[i_all], root_all)
+rel[i_ag ] <- strip_prefix(df$Population[i_ag ], root_ag )
+df$rel_subset <- rel
+
+# Final subset label: compartment + "/" + relative (root alone -> compartment)
+df$subset_label <- if_else(df$rel_subset == "" | is.na(df$rel_subset),
+                           df$compartment,
+                           paste0(df$compartment, "/", df$rel_subset))
+
+# ---- Matrices: rows=subset_label, cols=ALId ----
+collapse_wide <- function(dat, value_col){
+  dat %>%
+    group_by(subset_label, ALId) %>%
+    summarize(val = dplyr::first(.data[[value_col]]), .groups = "drop") %>%
+    mutate(ALId = as.character(ALId)) %>%
+    pivot_wider(names_from = ALId, values_from = val) %>%
+    arrange(subset_label)
+}
+
+pctParent    <- collapse_wide(df, "PercentParent")
+parentCounts <- collapse_wide(df, "ParentCount")
+popCounts    <- collapse_wide(df, "Count")
+
+# ---- Nodes (PBplus-style) with NSM-specific root strings ---------------------
+# You asked for explicit roots in "root" field:
+#   global root           = "global/Bcells/PB/Q2: IgD_BUV615+ , CD27_APCR700+"
+#   antigen_specific root = "antigen_specific/Bcells/RBD+/PB/Q2: IgD_BUV615+ , CD27_APCR700+"
+subset_vec <- if ("subset_label" %in% names(pctParent)) pctParent$subset_label else pctParent$subset
+
+make_nodes_nsm <- function(subset_vec, root_all, root_ag) {
+  comp <- ifelse(grepl("^antigen_specific($|/)", subset_vec), "antigen_specific", "global")
+  rel  <- ifelse(comp == "global",
+                 sub("^global/?", "", subset_vec),
+                 sub("^antigen_specific/?", "", subset_vec))
+
+  parts <- strsplit(rel, "/", fixed = TRUE)
+  ncomp <- vapply(parts, length, integer(1))
+
+  terminal_node <- vapply(seq_along(parts), function(i) {
+    if (ncomp[i] == 0) comp[i] else tail(parts[[i]], 1)
+  }, character(1))
+
+  modifier_1 <- vapply(seq_along(parts), function(i) {
+    if (ncomp[i] >= 2) parts[[i]][1] else NA_character_
+  }, character(1))
+
+  modifier_2 <- vapply(seq_along(parts), function(i) {
+    if (ncomp[i] >= 3) parts[[i]][2] else NA_character_
+  }, character(1))
+
+  depth <- ncomp  # root=0; one token=1; etc.
+
+  rootPath <- ifelse(comp == "global", root_all, root_ag)
+  pathInCompartment <- ifelse(ncomp == 0, NA_character_, rel)
+  path <- ifelse(ncomp == 0, rootPath, paste(rootPath, rel, sep = "/"))
+
+  root_global_str <- "global/Bcells/PB/Q2: IgD_BUV615+ , CD27_APCR700+"
+  root_ag_str     <- "antigen_specific/Bcells/RBD+/PB/Q2: IgD_BUV615+ , CD27_APCR700+"
+  root_field <- ifelse(comp == "global", root_global_str, root_ag_str)
+
+  data.frame(
+    subset            = subset_vec,
+    depth             = depth,
+    terminal_node     = terminal_node,
+    modifier_1        = modifier_1,
+    modifier_2        = modifier_2,
+    pathInCompartment = pathInCompartment,
+    rootPath          = rootPath,
+    root              = root_field,
+    path              = path,
+    stringsAsFactors  = FALSE
+  )
+}
+
+nodes <- make_nodes_nsm(subset_vec, root_all, root_ag)
+
+# ---- Helper: first non-NA / non-blank ----
+first_non_na <- function(x) {
+  y <- x[!is.na(x) & x != ""]
+  if (length(y)) y[1] else NA
+}
+
+# ---- Design: 1 row per ALId, add paired sample names/paths ----
+pair_map <- df %>%
+  mutate(ALId = as.character(ALId)) %>%
+  group_by(ALId, compartment) %>%
+  summarize(
+    sample_key      = first_non_na(sample_key),
+    fcs_file        = first_non_na(fcs_file),
+    transformed_fcs = first_non_na(transformed_fcs),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(
+    id_cols    = ALId,
+    names_from = compartment,
+    values_from = c(sample_key, fcs_file, transformed_fcs),
+    names_sep  = "_"
+  ) %>%
+  dplyr::rename(
+    sample_global            = sample_key_global,
+    sample_ag                = sample_key_antigen_specific,
+    fcs_file_global          = fcs_file_global,
+    fcs_file_ag              = fcs_file_antigen_specific,
+    transformed_fcs_global   = transformed_fcs_global,
+    transformed_fcs_ag       = transformed_fcs_antigen_specific
+  )
+
+# ---- Metadata per ALId (only columns that exist in df) ----
+meta_cols <- intersect(
+  c("patientType","khorLabId","ageAtDraw","sex","group","batch","drawDate","race","hispanic"),
+  names(df)
+)
+
+meta_by_AL <- df %>%
+  mutate(ALId = as.character(ALId)) %>%
+  group_by(ALId) %>%
+  summarize(
+    across(all_of(meta_cols), first_non_na, .names = "{.col}"),
+    .groups = "drop"
+  )
+
+design_out <- meta_by_AL %>%
+  full_join(pair_map, by = "ALId") %>%
+  arrange(ALId)
+
+# ---- Reorder matrix columns to ALId order in design_out ----
+al_order <- design_out$ALId
+have     <- intersect(colnames(pctParent), al_order)
+pctParent    <- pctParent    %>% select(subset_label, all_of(have)) %>% rename(subset = subset_label)
+parentCounts <- parentCounts %>% select(subset_label, all_of(have)) %>% rename(subset = subset_label)
+popCounts    <- popCounts    %>% select(subset_label, all_of(have)) %>% rename(subset = subset_label)
+
+# ---- Package ----
+New_matrices_NSM <- list(
+  parentCounts = parentCounts,
+  popCounts    = popCounts,
+  pctParent    = pctParent,
+  design       = design_out,
+  nodes        = nodes
+)
+
+# ---- Carry over extra fields from original 'design' if present ----
+New_matrices_NSM$design <- New_matrices_NSM$design %>% mutate(ALId = as.character(ALId))
+design_fix <- design %>% mutate(ALId = as.character(ALId))
+
+want <- intersect(c("testId", "longitudinalDrawDescription"), names(design_fix))
+if (length(want)) {
+  extra_by_AL <- design_fix %>%
+    group_by(ALId) %>%
+    summarize(across(all_of(want), ~ dplyr::first(na.omit(.))), .groups = "drop")
+  New_matrices_NSM$design <- New_matrices_NSM$design %>%
+    left_join(extra_by_AL, by = "ALId")
+}
+
+# ---- Save ----
+dir.create("/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/roots",
+           showWarnings = FALSE, recursive = TRUE)
+
+save(New_matrices_NSM,
+     file = "/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/roots/Full_object_NSM.Rdata")
+
+```
+## build full Q3: True naive object with all 5 matrices
+```{r build full Q3: True naive object with all 5 matrices}
+# --- Build full Tn object (Q3: Tn) with all 5 matrices -----------------------
+suppressPackageStartupMessages({library(dplyr); library(tidyr); library(stringr)})
+
+# ---- Inputs ----
+file <- "/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/counts_NEW_Tn.Rdata"
+nm <- load(file)  # contains "counts"
+
+# Alias to consistent name
+stopifnot(exists("counts", inherits = TRUE))
+counts_NEW_Tn <- get("counts", inherits = TRUE)
+stopifnot(is.data.frame(counts_NEW_Tn))
+
+# Require 'design' in the environment
+stopifnot(exists("design"))
+
+# ---- ROOTS (keep exactly as specified) ----
+root_all <- "/Live_Stringent/LYM/Barcode/CD19+ dump-/B cells/PB/Q3: IgD_BUV615+ , CD27_APCR700-"
+root_ag  <- "/Live_Stringent/LYM/Barcode/CD19+ dump-/B cells/RBD+/PB/Q3: IgD_BUV615+ , CD27_APCR700-"
+
+strip_prefix <- function(x, prefix){
+  out <- x
+  i1 <- startsWith(x, paste0(prefix, "/")); out[i1] <- substring(x[i1], nchar(prefix) + 2L)
+  i2 <- startsWith(x, prefix) & !i1;        out[i2] <- substring(x[i2], nchar(prefix) + 1L)
+  out
+}
+
+# ---- Map FCS to ALId and metadata ----
+design_map <- design %>%
+  mutate(
+    sample_file = dplyr::coalesce(
+      get0("sampleNameOriginal", ifnotfound = NULL),
+      get0("sampleName",         ifnotfound = NULL),
+      basename(get0("fcsFiles",  ifnotfound = ""))  # fallback
+    ),
+    sample_key  = sub("\\.fcs$","", basename(sample_file))
+  ) %>%
+  select(
+    ALId, sample_key,
+    patientType = any_of("patientType"),
+    khorLabId   = any_of("khorLabId"),
+    ageAtDraw   = any_of("ageAtDraw"),
+    sex         = any_of("sex"),
+    group       = any_of("group"),
+    batch       = any_of("batch"),
+    fcs_file        = any_of("fcsFiles"),
+    transformed_fcs = any_of("transformedFcs"),
+    drawDate        = any_of("drawDate"),
+    race            = any_of("race"),
+    hispanic        = any_of("hispanic")
+  ) %>%
+  distinct()
+
+# ---- Attach ALId/metadata to counts_NEW_Tn ----
+df <- counts_NEW_Tn %>%
+  mutate(
+    sample_key  = sub("\\.fcs$","", basename(as.character(name))),
+    compartment = if_else(grepl("/RBD\\+/", Population), "antigen_specific", "global")
+  ) %>%
+  left_join(design_map, by = "sample_key") %>%
+  dplyr::filter(!grepl("IC", sample_key, fixed = TRUE))
+
+# Drop rows lacking ALId
+missing_al <- df %>% dplyr::filter(is.na(ALId)) %>% distinct(sample_key)
+if (nrow(missing_al)) message("Warning: dropping ", nrow(missing_al), " rows with missing ALId.")
+df <- df %>% dplyr::filter(!is.na(ALId))
+
+# ---- Relative subset under the two Tn roots ----
+rel <- character(nrow(df))
+i_all <- startsWith(df$Population, root_all)
+i_ag  <- startsWith(df$Population, root_ag)
+rel[i_all] <- strip_prefix(df$Population[i_all], root_all)
+rel[i_ag ] <- strip_prefix(df$Population[i_ag ], root_ag )
+df$rel_subset <- rel
+
+# Final subset label
+df$subset_label <- if_else(df$rel_subset == "" | is.na(df$rel_subset),
+                           df$compartment,
+                           paste0(df$compartment, "/", df$rel_subset))
+
+# ---- Matrices: rows=subset_label, cols=ALId ----
+collapse_wide <- function(dat, value_col){
+  dat %>%
+    group_by(subset_label, ALId) %>%
+    summarize(val = dplyr::first(.data[[value_col]]), .groups = "drop") %>%
+    mutate(ALId = as.character(ALId)) %>%
+    pivot_wider(names_from = ALId, values_from = val) %>%
+    arrange(subset_label)
+}
+
+pctParent    <- collapse_wide(df, "PercentParent")
+parentCounts <- collapse_wide(df, "ParentCount")
+popCounts    <- collapse_wide(df, "Count")
+
+# ---- Nodes (PBplus/NSM-style) with Tn root strings --------------------------
+subset_vec <- if ("subset_label" %in% names(pctParent)) pctParent$subset_label else pctParent$subset
+
+make_nodes_tn <- function(subset_vec, root_all, root_ag) {
+  comp <- ifelse(grepl("^antigen_specific($|/)", subset_vec), "antigen_specific", "global")
+  rel  <- ifelse(comp == "global",
+                 sub("^global/?", "", subset_vec),
+                 sub("^antigen_specific/?", "", subset_vec))
+
+  parts <- strsplit(rel, "/", fixed = TRUE)
+  ncomp <- vapply(parts, length, integer(1))
+
+  terminal_node <- vapply(seq_along(parts), function(i) {
+    if (ncomp[i] == 0) comp[i] else tail(parts[[i]], 1)
+  }, character(1))
+
+  modifier_1 <- vapply(seq_along(parts), function(i) {
+    if (ncomp[i] >= 2) parts[[i]][1] else NA_character_
+  }, character(1))
+
+  modifier_2 <- vapply(seq_along(parts), function(i) {
+    if (ncomp[i] >= 3) parts[[i]][2] else NA_character_
+  }, character(1))
+
+  depth <- ncomp
+
+  rootPath <- ifelse(comp == "global", root_all, root_ag)
+  pathInCompartment <- ifelse(ncomp == 0, NA_character_, rel)
+  path <- ifelse(ncomp == 0, rootPath, paste(rootPath, rel, sep = "/"))
+
+  root_global_str <- "global/Bcells/PB/Q3: IgD_BUV615+ , CD27_APCR700-"
+  root_ag_str     <- "antigen_specific/Bcells/RBD+/PB/Q3: IgD_BUV615+ , CD27_APCR700-"
+  root_field <- ifelse(comp == "global", root_global_str, root_ag_str)
+
+  data.frame(
+    subset            = subset_vec,
+    depth             = depth,
+    terminal_node     = terminal_node,
+    modifier_1        = modifier_1,
+    modifier_2        = modifier_2,
+    pathInCompartment = pathInCompartment,
+    rootPath          = rootPath,
+    root              = root_field,
+    path              = path,
+    stringsAsFactors  = FALSE
+  )
+}
+
+nodes <- make_nodes_tn(subset_vec, root_all, root_ag)
+
+# ---- Helper ----
+first_non_na <- function(x) {
+  y <- x[!is.na(x) & x != ""]
+  if (length(y)) y[1] else NA
+}
+
+# ---- Design: 1 row per ALId, plus paired sample names/paths ----
+pair_map <- df %>%
+  mutate(ALId = as.character(ALId)) %>%
+  group_by(ALId, compartment) %>%
+  summarize(
+    sample_key      = first_non_na(sample_key),
+    fcs_file        = first_non_na(fcs_file),
+    transformed_fcs = first_non_na(transformed_fcs),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(
+    id_cols    = ALId,
+    names_from = compartment,
+    values_from = c(sample_key, fcs_file, transformed_fcs),
+    names_sep  = "_"
+  ) %>%
+  dplyr::rename(
+    sample_global            = sample_key_global,
+    sample_ag                = sample_key_antigen_specific,
+    fcs_file_global          = fcs_file_global,
+    fcs_file_ag              = fcs_file_antigen_specific,
+    transformed_fcs_global   = transformed_fcs_global,
+    transformed_fcs_ag       = transformed_fcs_antigen_specific
+  )
+
+# ---- Metadata per ALId (only columns that exist) ----
+meta_cols <- intersect(
+  c("patientType","khorLabId","ageAtDraw","sex","group","batch","drawDate","race","hispanic"),
+  names(df)
+)
+
+meta_by_AL <- df %>%
+  mutate(ALId = as.character(ALId)) %>%
+  group_by(ALId) %>%
+  summarize(
+    across(all_of(meta_cols), first_non_na, .names = "{.col}"),
+    .groups = "drop"
+  )
+
+design_out <- meta_by_AL %>%
+  full_join(pair_map, by = "ALId") %>%
+  arrange(ALId)
+
+# ---- Reorder matrices to ALId order ----
+al_order <- design_out$ALId
+have     <- intersect(colnames(pctParent), al_order)
+pctParent    <- pctParent    %>% select(subset_label, all_of(have)) %>% rename(subset = subset_label)
+parentCounts <- parentCounts %>% select(subset_label, all_of(have)) %>% rename(subset = subset_label)
+popCounts    <- popCounts    %>% select(subset_label, all_of(have)) %>% rename(subset = subset_label)
+
+# ---- Package ----
+New_matrices_Tn <- list(
+  parentCounts = parentCounts,
+  popCounts    = popCounts,
+  pctParent    = pctParent,
+  design       = design_out,
+  nodes        = nodes
+)
+
+# ---- Carry over extras from original 'design' if present ----
+New_matrices_Tn$design <- New_matrices_Tn$design %>% mutate(ALId = as.character(ALId))
+design_fix <- design %>% mutate(ALId = as.character(ALId))
+
+want <- intersect(c("testId", "longitudinalDrawDescription"), names(design_fix))
+if (length(want)) {
+  extra_by_AL <- design_fix %>%
+    group_by(ALId) %>%
+    summarize(across(all_of(want), ~ dplyr::first(na.omit(.))), .groups = "drop")
+  New_matrices_Tn$design <- New_matrices_Tn$design %>%
+    left_join(extra_by_AL, by = "ALId")
+}
+
+# ---- Save ----
+dir.create("/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/roots",
+           showWarnings = FALSE, recursive = TRUE)
+
+save(New_matrices_Tn,
+     file = "/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/roots/Full_object_Tn.Rdata")
+
+```
+## build full Q4: Double negative object with all 5 matrices
+```{r build full Q4: Double negative object with all 5 matrices}
+# --- Build full DN object (Q4: DN) with all 5 matrices -----------------------
+suppressPackageStartupMessages({library(dplyr); library(tidyr); library(stringr)})
+
+# ---- Inputs ----
+file <- "/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/roots/counts_NEW_DN.Rdata"
+nm <- load(file)  # robust to whatever the object name is
+
+# Pick/alias the long table to a consistent name
+pick <- NULL
+for (n in nm) {
+  obj <- get(n, inherits = TRUE)
+  if (is.data.frame(obj) && all(c("Population","name") %in% names(obj))) { pick <- n; break }
+}
+if (is.null(pick) && length(nm) == 1) pick <- nm[1]
+stopifnot(!is.null(pick))
+counts_NEW_DN <- get(pick, inherits = TRUE)
+stopifnot(is.data.frame(counts_NEW_DN))
+
+# Require 'design' to be present (as with NSM/Tn)
+stopifnot(exists("design"))
+
+# ---- ROOTS (exact strings) ----
+root_all <- "/Live_Stringent/LYM/Barcode/CD19+ dump-/B cells/PB/Q4: IgD_BUV615- , CD27_APCR700-"
+root_ag  <- "/Live_Stringent/LYM/Barcode/CD19+ dump-/B cells/RBD+/PB/Q4: IgD_BUV615- , CD27_APCR700-"
+
+strip_prefix <- function(x, prefix){
+  out <- x
+  i1 <- startsWith(x, paste0(prefix, "/")); out[i1] <- substring(x[i1], nchar(prefix) + 2L)
+  i2 <- startsWith(x, prefix) & !i1;        out[i2] <- substring(x[i2], nchar(prefix) + 1L)
+  out
+}
+
+# ---- Map FCS to ALId and metadata (robust to design column variants) ----
+design_map <- design %>%
+  mutate(
+    sample_file = dplyr::coalesce(
+      get0("sampleNameOriginal", ifnotfound = NULL),
+      get0("sampleName",         ifnotfound = NULL),
+      basename(get0("fcsFiles",  ifnotfound = ""))  # fallback
+    ),
+    sample_key  = sub("\\.fcs$","", basename(sample_file))
+  ) %>%
+  select(
+    ALId, sample_key,
+    patientType = any_of("patientType"),
+    khorLabId   = any_of("khorLabId"),
+    ageAtDraw   = any_of("ageAtDraw"),
+    sex         = any_of("sex"),
+    group       = any_of("group"),
+    batch       = any_of("batch"),
+    fcs_file        = any_of("fcsFiles"),
+    transformed_fcs = any_of("transformedFcs"),
+    drawDate        = any_of("drawDate"),
+    race            = any_of("race"),
+    hispanic        = any_of("hispanic")
+  ) %>%
+  distinct()
+
+# ---- Attach ALId/metadata; call compartments from Population; drop ICs ----
+df <- counts_NEW_DN %>%
+  mutate(
+    sample_key  = sub("\\.fcs$","", basename(as.character(name))),
+    compartment = if_else(grepl("/RBD\\+/", Population), "antigen_specific", "global")
+  ) %>%
+  left_join(design_map, by = "sample_key") %>%
+  dplyr::filter(!grepl("IC", sample_key, fixed = TRUE))
+
+# Drop rows lacking ALId (cannot pivot)
+missing_al <- df %>% dplyr::filter(is.na(ALId)) %>% distinct(sample_key)
+if (nrow(missing_al)) message("Warning: dropping ", nrow(missing_al), " rows with missing ALId.")
+df <- df %>% dplyr::filter(!is.na(ALId))
+
+# ---- Relative subset under the two DN roots ----
+rel <- character(nrow(df))
+i_all <- startsWith(df$Population, root_all)
+i_ag  <- startsWith(df$Population, root_ag)
+rel[i_all] <- strip_prefix(df$Population[i_all], root_all)
+rel[i_ag ] <- strip_prefix(df$Population[i_ag ], root_ag )
+df$rel_subset <- rel
+
+# Final subset label: compartment or compartment/<relative>
+df$subset_label <- if_else(df$rel_subset == "" | is.na(df$rel_subset),
+                           df$compartment,
+                           paste0(df$compartment, "/", df$rel_subset))
+
+# ---- Matrices: rows=subset_label, cols=ALId ----
+collapse_wide <- function(dat, value_col){
+  dat %>%
+    group_by(subset_label, ALId) %>%
+    summarize(val = dplyr::first(.data[[value_col]]), .groups = "drop") %>%
+    mutate(ALId = as.character(ALId)) %>%
+    tidyr::pivot_wider(names_from = ALId, values_from = val) %>%
+    arrange(subset_label)
+}
+
+pctParent    <- collapse_wide(df, "PercentParent")
+parentCounts <- collapse_wide(df, "ParentCount")
+popCounts    <- collapse_wide(df, "Count")
+
+# ---- Nodes (NSM/Tn-style) with explicit DN root strings ---------------------
+subset_vec <- if ("subset_label" %in% names(pctParent)) pctParent$subset_label else pctParent$subset
+
+make_nodes_dn <- function(subset_vec, root_all, root_ag) {
+  comp <- ifelse(grepl("^antigen_specific($|/)", subset_vec), "antigen_specific", "global")
+  rel  <- ifelse(comp == "global",
+                 sub("^global/?", "", subset_vec),
+                 sub("^antigen_specific/?", "", subset_vec))
+
+  parts <- strsplit(rel, "/", fixed = TRUE)
+  ncomp <- vapply(parts, length, integer(1))
+
+  terminal_node <- vapply(seq_along(parts), function(i) {
+    if (ncomp[i] == 0) comp[i] else tail(parts[[i]], 1)
+  }, character(1))
+
+  modifier_1 <- vapply(seq_along(parts), function(i) {
+    if (ncomp[i] >= 2) parts[[i]][1] else NA_character_
+  }, character(1))
+
+  modifier_2 <- vapply(seq_along(parts), function(i) {
+    if (ncomp[i] >= 3) parts[[i]][2] else NA_character_
+  }, character(1))
+
+  depth <- ncomp
+
+  rootPath <- ifelse(comp == "global", root_all, root_ag)
+  pathInCompartment <- ifelse(ncomp == 0, NA_character_, rel)
+  path <- ifelse(ncomp == 0, rootPath, paste(rootPath, rel, sep = "/"))
+
+  root_global_str <- "global/Bcells/PB/Q4: IgD_BUV615- , CD27_APCR700-"
+  root_ag_str     <- "antigen_specific/Bcells/RBD+/PB/Q4: IgD_BUV615- , CD27_APCR700-"
+  root_field <- ifelse(comp == "global", root_global_str, root_ag_str)
+
+  data.frame(
+    subset            = subset_vec,
+    depth             = depth,
+    terminal_node     = terminal_node,
+    modifier_1        = modifier_1,
+    modifier_2        = modifier_2,
+    pathInCompartment = pathInCompartment,
+    rootPath          = rootPath,
+    root              = root_field,
+    path              = path,
+    stringsAsFactors  = FALSE
+  )
+}
+
+nodes <- make_nodes_dn(subset_vec, root_all, root_ag)
+
+# ---- Helper: first non-NA / non-blank ----
+first_non_na <- function(x) {
+  y <- x[!is.na(x) & x != ""]
+  if (length(y)) y[1] else NA
+}
+
+# ---- Design: 1 row per ALId, plus paired sample names/paths ----
+pair_map <- df %>%
+  mutate(ALId = as.character(ALId)) %>%
+  group_by(ALId, compartment) %>%
+  summarize(
+    sample_key      = first_non_na(sample_key),
+    fcs_file        = first_non_na(fcs_file),
+    transformed_fcs = first_non_na(transformed_fcs),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(
+    id_cols    = ALId,
+    names_from = compartment,
+    values_from = c(sample_key, fcs_file, transformed_fcs),
+    names_sep  = "_"
+  ) %>%
+  dplyr::rename(
+    sample_global            = sample_key_global,
+    sample_ag                = sample_key_antigen_specific,
+    fcs_file_global          = fcs_file_global,
+    fcs_file_ag              = fcs_file_antigen_specific,
+    transformed_fcs_global   = transformed_fcs_global,
+    transformed_fcs_ag       = transformed_fcs_antigen_specific
+  )
+
+# ---- Metadata per ALId (only over columns that exist) ----
+meta_cols <- intersect(
+  c("patientType","khorLabId","ageAtDraw","sex","group","batch","drawDate","race","hispanic"),
+  names(df)
+)
+
+meta_by_AL <- df %>%
+  mutate(ALId = as.character(ALId)) %>%
+  group_by(ALId) %>%
+  summarize(
+    across(all_of(meta_cols), first_non_na, .names = "{.col}"),
+    .groups = "drop"
+  )
+
+design_out <- meta_by_AL %>%
+  full_join(pair_map, by = "ALId") %>%
+  arrange(ALId)
+
+# ---- Reorder matrices’ columns to ALId order ----
+al_order <- design_out$ALId
+have     <- intersect(colnames(pctParent), al_order)
+pctParent    <- pctParent    %>% select(subset_label, all_of(have)) %>% rename(subset = subset_label)
+parentCounts <- parentCounts %>% select(subset_label, all_of(have)) %>% rename(subset = subset_label)
+popCounts    <- popCounts    %>% select(subset_label, all_of(have)) %>% rename(subset = subset_label)
+
+# ---- Package ----
+New_matrices_DN <- list(
+  parentCounts = parentCounts,
+  popCounts    = popCounts,
+  pctParent    = pctParent,
+  design       = design_out,
+  nodes        = nodes
+)
+
+# ---- Carry over extras from original 'design' if present ----
+New_matrices_DN$design <- New_matrices_DN$design %>% mutate(ALId = as.character(ALId))
+design_fix <- design %>% mutate(ALId = as.character(ALId))
+
+want <- intersect(c("testId", "longitudinalDrawDescription"), names(design_fix))
+if (length(want)) {
+  extra_by_AL <- design_fix %>%
+    group_by(ALId) %>%
+    summarize(across(all_of(want), ~ dplyr::first(na.omit(.))), .groups = "drop")
+  New_matrices_DN$design <- New_matrices_DN$design %>%
+    left_join(extra_by_AL, by = "ALId")
+}
+
+# ---- Save ----
+dir.create("/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/roots",
+           showWarnings = FALSE, recursive = TRUE)
+
+save(New_matrices_DN,
+     file = "/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/roots/Full_object_DN.Rdata")
+
+
+```
+
+## calculate what pct of B cells gate are Tn (Q3) for both compartments
+```{r calculate what pct of B cells gate are Tn (Q3) for both compartments}
+############ How to calculate what pct of B cells gate are Tn (Q3) for both compartments ########################################
+
+# Percent of *B cells* that are True naive (Q3), for both compartments
+library(dplyr)
+library(ggplot2)
+
+# 1) Load the leaf (Q3) object and the full long table (for denominators)
+load("/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/roots/counts_Tn.Rdata")         # -> counts_Tn (only Q3 leaves)
+load("/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/counts_Bcells.Rdata")           # -> counts (all nodes long)
+
+# 2) Pull the B-cells counts per sample (same file names)
+bcell_path <- "/Live_Stringent/LYM/Barcode/CD19+ dump-/B cells"
+denom <- counts %>%
+  dplyr::filter(Population == bcell_path) %>%
+  dplyr::select(name, BcellsCount = Count)
+
+# 3) Join and compute % of B cells
+tn_b <- counts_Tn %>%
+  dplyr::left_join(denom, by = "name") %>%
+  dplyr::mutate(PercentOfB = 100 * Count / BcellsCount)
+
+# (optional) quick sanity
+missing_den <- sum(is.na(tn_b$BcellsCount))
+if (missing_den > 0) message("Missing B-cells denominator for ", missing_den, " rows (check sample names).")
+
+# 4) Plot: x = compartment, y = % of B cells that are True naive (Q3)
+ggplot(tn_b, aes(x = compartment, y = PercentOfB)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.35) +
+  geom_jitter(width = 0.15, height = 0, size = 1.4, alpha = 0.7) +
+  theme_bw(base_size = 11) +
+  labs(title = "True naive (Q3) — % of B cells", x = "Compartment", y = "% of B cells")
+
+# True naive (Q3): export table for sanity check
+library(dplyr)
+library(readr)
+
+# 1) Load leaf (Q3) object and the full long table (for denominators)
+load("/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/roots/counts_Tn.Rdata")         # -> counts_Tn (only Q3 leaves)
+load("/Users/rgomez/Khor_covidvax_response_IMPACD/data_RG_2025_05/counts_Bcells.Rdata")           # -> counts (all nodes long)
+
+# 2) Pull B-cells (denominator) per sample
+bcell_path <- "/Live_Stringent/LYM/Barcode/CD19+ dump-/B cells"
+denom_b <- counts %>%
+  dplyr::filter(Population == bcell_path) %>%
+  select(name, BcellsCount = Count)
+
+# 3) Build sanity table: keep the two exact Q3 leaves, join denom, compute % of B cells
+tn_tbl <- counts_Tn %>%
+  select(name, Population, Count, ParentCount, PercentParent, compartment) %>%
+  left_join(denom_b, by = "name") %>%
+  mutate(
+    sampleName   = sub("\\.fcs$", "", name),
+    PercentOfB   = 100 * Count / BcellsCount
+  ) %>%
+  select(sampleName, compartment, Population,
+         Count, ParentCount, PercentParent,
+         BcellsCount, PercentOfB) %>%
+  arrange(compartment, sampleName)
+
+# 4) Write CSV
+out_dir <- "/Users/rgomez/Khor_covidvax_response_IMPACD/tables_RG_2025_05/Flow/Bcells"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+write_csv(tn_tbl, file.path(out_dir, "true_naive_Q3_percent_of_Bcells.csv"))
+
+
+
+```
